@@ -1,1 +1,6 @@
 venv/
+_old/
+data/
+notebooks
+output/
+processed/
