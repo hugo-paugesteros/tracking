@@ -1,0 +1,7 @@
+napari[all]
+trackpy
+pandas
+liffile
+scipy
+scikit-image
+magicgui

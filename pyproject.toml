@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracker"
+version = "0.1.0"
+description = "A dynamic cell tracking and colocalization tool for Napari."
+dependencies = [
+    "napari[all]",
+    "trackpy",
+    "pandas",
+    "liffile",
+    "scipy",
+    "scikit-image",
+    "magicgui"
+]
+
+[project.scripts]
+launch-tracker = "tracker.main:main"

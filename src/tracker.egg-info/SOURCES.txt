@@ -1,0 +1,8 @@
+pyproject.toml
+src/tracker/main.py
+src/tracker.egg-info/PKG-INFO
+src/tracker.egg-info/SOURCES.txt
+src/tracker.egg-info/dependency_links.txt
+src/tracker.egg-info/entry_points.txt
+src/tracker.egg-info/requires.txt
+src/tracker.egg-info/top_level.txt

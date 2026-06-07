@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: tracker
+Version: 0.1.0
+Summary: A dynamic cell tracking and colocalization tool for Napari.
+Requires-Dist: napari[all]
+Requires-Dist: trackpy
+Requires-Dist: pandas
+Requires-Dist: liffile
+Requires-Dist: scipy
+Requires-Dist: scikit-image
+Requires-Dist: magicgui
