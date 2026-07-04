@@ -13,8 +13,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
+da_raw = None
+channel_map = {}
+
+
 def main():
-    da_raw = None
     viewer = napari.Viewer()
 
     kwargs = {
@@ -23,11 +26,9 @@ def main():
         "size": 15,
         "opacity": 0.5,
     }
-    layer_green = viewer.add_points(
-        name="Green Points", border_color="orange", **kwargs
-    )
-    layer_red = viewer.add_points(name="Red Points", border_color="orange", **kwargs)
-    layer_blue = viewer.add_points(name="Blue Points", border_color="orange", **kwargs)
+    layer_rh4 = viewer.add_points(name="Rh4 Points", border_color="orange", **kwargs)
+    layer_rh5 = viewer.add_points(name="Rh5 Points", border_color="orange", **kwargs)
+    layer_rh6 = viewer.add_points(name="Rh6 Points", border_color="orange", **kwargs)
     layer_roi = viewer.add_shapes(
         name="1. Draw ROI Here",
         shape_type="polygon",
@@ -50,44 +51,107 @@ def main():
     @magicgui(
         path={"label": "1. Choose LIF file:", "filter": "*.lif"},
         image_index={"label": "2. Select Image:", "choices": get_image_choices},
+        color_profile={
+            "choices": [
+                "Profile 1 (Rh4: Green, Rh6: Red, Rh5: Blue)",
+                "Profile 2 (Rh4: Blue, Rh6: Green, Rh5: Red)",
+            ],
+            "label": "3. Colors:",
+        },
         call_button="Load Data into Viewer",
     )
-    def filepicker(path: Path, image_index: int):
+    def filepicker(
+        path: Path,
+        image_index: int,
+        color_profile: str = "Profile 1 (Rh4: Green, Rh6: Red, Rh5: Blue)",
+    ):
+        global da_raw, channel_map
         with liffile.LifFile(path) as lif:
-            global da_raw
             da_raw = lif.images[image_index].asxarray()
-            # da_raw = da_raw.reindex(Z=da_raw.Z[::-1])
 
-            # Reset old image
-            for layer_name in ["Green", "Red", "Blue"]:
+            for layer_name in ["Rh4", "Rh6", "Rh5"]:
                 if layer_name in viewer.layers:
                     viewer.layers.remove(layer_name)
 
+            try:
+                c_metadata = da_raw.coords["C"].values
+                channel_map = {
+                    "Rh4": np.where(c_metadata == "ALEXA 488")[0][0],
+                    "Rh6": np.where(c_metadata == "ALEXA 555")[0][0],
+                    "Rh5": np.where(c_metadata == "ALEXA 647")[0][0],
+                }
+            except Exception:
+                print("Warning: Channel metadata not found. Using default order.")
+                channel_map = {"Rh4": 0, "Rh6": 1, "Rh5": 2}
+
+            names_in_order = [""] * 3
+            for target, idx in channel_map.items():
+                names_in_order[idx] = target
+
+            # 4. Map the requested colors to those targets
+            if "Profile 1" in color_profile:
+                color_map = {"Rh4": "green", "Rh6": "red", "Rh5": "blue"}
+            else:
+                color_map = {"Rh4": "blue", "Rh6": "green", "Rh5": "red"}
+
+            # Create a list of colors that perfectly matches the physical channel order
+            colors_in_order = [color_map[target] for target in names_in_order]
+
+            # 5. The elegant single-call plot!
+            # We pass da_raw.values directly because we already made it a safe RAM block
             viewer.add_image(
-                da_raw,
+                da_raw.values,
                 channel_axis=len(da_raw.shape) - 3,
-                name=["Green", "Red", "Blue"],
-                colormap=["green", "red", "blue"],
+                name=names_in_order,
+                colormap=colors_in_order,
                 blending="additive",
+                rendering="mip",
             )
+
+            # 6. Formatting and resets
             viewer.dims.set_current_step(0, 0)  # Force z=0 at first
 
-            for layer_name in ["Green", "Red", "Blue"]:
+            for layer_name in ["Rh4", "Rh6", "Rh5"]:
                 viewer.layers.move(viewer.layers.index(layer_name), 0)
 
             # Reset data
-            layer_green.data = np.empty((0, 3))
-            layer_red.data = np.empty((0, 3))
-            layer_blue.data = np.empty((0, 3))
+            layer_rh4.data = np.empty((0, 3))
+            layer_rh5.data = np.empty((0, 3))
+            layer_rh6.data = np.empty((0, 3))
             layer_roi.data = []
 
     @filepicker.path.changed.connect
     def _update_dropdown(new_path: Path):
         filepicker.image_index.reset_choices()
 
+    @magicgui(call_button="Flip Z-Axis (Up/Down)")
+    def flip_z_axis_widget():
+        global da_raw, channel_map
+
+        if da_raw is None:
+            print("Please load an image first.")
+            return
+
+        print("\n--- Flipping Z-Axis ---")
+
+        if "Z" in da_raw.dims:
+            da_raw = da_raw.reindex(Z=da_raw.Z[::-1])
+
+        c_axis = len(da_raw.shape) - 3
+
+        for target_name, c_index in channel_map.items():
+            if target_name in viewer.layers:
+                if c_axis == 1:
+                    viewer.layers[target_name].data = da_raw.values[:, c_index, :, :]
+                else:
+                    viewer.layers[target_name].data = da_raw.values[c_index, :, :]
+
+        viewer.dims.set_current_step(0, 0)
+        print("Success: Z-axis inverted.")
+
     @magicgui(
         call_button="Predict All Frames",
-        target_channel={"choices": ["All", "Green", "Red", "Blue"], "label": "Channel"},
+        target_channel={"choices": ["All", "Rh4", "Rh6", "Rh5"], "label": "Channel"},
         diameter={"step": 2, "min": 3, "max": 51},
         minmass={"min": 100, "max": 10000, "step": 100},
         threshold={"min": 0, "max": 255},
@@ -98,6 +162,7 @@ def main():
         minmass: int = 700,
         threshold: int = 30,
     ):
+        global da_raw, channel_map
         print(f"\n--- Starting Batch Prediction: {target_channel} ---")
 
         # 1. Generate the ROI Mask
@@ -118,18 +183,18 @@ def main():
         else:
             print("No ROI drawn. Processing the entire image...")
 
-        # Define the mapping to the data and UI layers
-        channel_map = {
-            "Green": {"index": 0, "layer": layer_green},
-            "Red": {"index": 1, "layer": layer_red},
-            "Blue": {"index": 2, "layer": layer_blue},
+        target_layers = {
+            "Rh4": layer_rh4,
+            "Rh6": layer_rh6,
+            "Rh5": layer_rh5,
         }
 
-        # Decide which channels to process based on dropdown
         if target_channel == "All":
-            channels_to_process = ["Green", "Red", "Blue"]
+            channels_to_process = ["Rh4", "Rh6", "Rh5"]
         else:
             channels_to_process = [target_channel]
+
+        c_axis = len(da_raw.shape) - 3
 
         # Process each selected channel sequentially
         for ch in channels_to_process:
@@ -137,15 +202,19 @@ def main():
                 f"Processing {ch} channel (D={diameter}, Mass={minmass}, Thresh={threshold})..."
             )
 
-            c_index = channel_map[ch]["index"]
-            active_layer = channel_map[ch]["layer"]
+            # Instantly get the correct physical index from our global dictionary
+            c_index = channel_map[ch]
+            active_layer = target_layers[ch]
 
-            # Extract the volume for this specific channel
-            # volume = da_raw.values[:, c_index, :, :]
-            volume = da_raw.values[c_index, :, :]
+            # Safely extract for 3D or 4D
+            if c_axis == 1:
+                volume = da_raw.values[:, c_index, :, :]
+            else:
+                volume = da_raw.values[c_index, :, :]
+
             masked_volume = volume * roi_mask[np.newaxis, :, :]
 
-            # Run Trackpy (keeping processes=1 to prevent window cloning!)
+            # Run Trackpy
             f = tp.batch(
                 masked_volume,
                 diameter=diameter,
@@ -450,6 +519,9 @@ def main():
 
     # Swap out or add this widget to the sidebar
     viewer.window.add_dock_widget(filepicker, name="1. Load File", area="right")
+    viewer.window.add_dock_widget(
+        flip_z_axis_widget, name="2. Orientation", area="right"
+    )
     viewer.window.add_dock_widget(
         predict_all_frames_widget, name="2. Point detection", area="right"
     )

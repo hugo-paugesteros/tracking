@@ -18,3 +18,9 @@ dependencies = [
 
 [project.scripts]
 launch-tracker = "tracker.main:main"
+
+[tool.ruff]
+src = ["src"]
+
+[tool.ty.environment]
+python = "venv"
