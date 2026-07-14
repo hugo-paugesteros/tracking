@@ -237,7 +237,7 @@ def main():
         print("--- Batch Prediction Complete! ---\n")
 
     @magicgui(
-        call_button="Link & Track Channels",
+        call_button="Link & Track Targets",
         track_radius={"label": "Max Tracking Drift (px)", "max": 50},
         merge_radius={
             "label": "Colocalization Radius (px)",
@@ -264,17 +264,18 @@ def main():
         print("\n--- Starting Colocalization & Tracking ---")
 
         # ---------------------------------------------------------
-        # 1. Harvest Data
+        # 1. Harvest Data using new Rh Layer Names
         # ---------------------------------------------------------
         df_list = []
-        for layer, color_name in [
-            (layer_green, "Green"),
-            (layer_red, "Red"),
-            (layer_blue, "Blue"),
+        # Make sure these variables match the names in your main() function!
+        for layer, target_name in [
+            (layer_rh4, "Rh4"),
+            (layer_rh6, "Rh6"),
+            (layer_rh5, "Rh5"),
         ]:
             if len(layer.data) > 0:
                 df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
-                df["color"] = color_name
+                df["target"] = target_name
                 df_list.append(df)
 
         if not df_list:
@@ -289,7 +290,7 @@ def main():
         merged_points = []
         for z, group in df_all.groupby("Z"):
             pts = group[["Y", "X"]].values
-            colors = group["color"].values
+            targets = group["target"].values
 
             tree = cKDTree(pts)
             clusters = tree.query_ball_tree(tree, r=merge_radius)
@@ -302,19 +303,10 @@ def main():
                     processed_indices.add(n)
 
                 mean_y, mean_x = np.mean(pts[neighbors, 0]), np.mean(pts[neighbors, 1])
-                cluster_colors = set(colors[neighbors])
 
-                # Name the state for THIS specific slice
-                if len(cluster_colors) == 3:
-                    slice_pheno = "Triple Positive"
-                elif "Green" in cluster_colors and "Red" in cluster_colors:
-                    slice_pheno = "Green + Red"
-                elif "Green" in cluster_colors and "Blue" in cluster_colors:
-                    slice_pheno = "Green + Blue"
-                elif "Red" in cluster_colors and "Blue" in cluster_colors:
-                    slice_pheno = "Red + Blue"
-                else:
-                    slice_pheno = f"{list(cluster_colors)[0]} Only"
+                # Elegantly join the targets into a single string (e.g. "Rh4 + Rh5")
+                cluster_targets = set(targets[neighbors])
+                slice_pheno = " + ".join(sorted(list(cluster_targets)))
 
                 merged_points.append(
                     {
@@ -335,71 +327,63 @@ def main():
 
         tp.quiet()
         t = tp.link(df_merged, search_range=track_radius, memory=memory)
-
-        # Determine the GLOBAL identity of the track based on its history
-        def get_track_phenotype(group):
-            colors_in_track = set()
-            for pheno in group["Slice_Phenotype"]:
-                if "Green" in pheno or "Triple" in pheno:
-                    colors_in_track.add("Green")
-                if "Red" in pheno or "Triple" in pheno:
-                    colors_in_track.add("Red")
-                if "Blue" in pheno or "Triple" in pheno:
-                    colors_in_track.add("Blue")
-
-            has_g, has_r, has_b = (
-                "Green" in colors_in_track,
-                "Red" in colors_in_track,
-                "Blue" in colors_in_track,
-            )
-
-            if has_g and has_r and has_b:
-                return "Blue -> Green -> Red"
-            if has_g and has_r:
-                return "Green -> Red"
-            if has_g and has_b:
-                return "Blue -> Green"
-            if has_r and has_b:
-                return "Blue -> Red"
-            if has_g:
-                return "Green Only"
-            if has_r:
-                return "Red Only"
-            if has_b:
-                return "Blue Only"
-            return "Unknown"
-
-        # Map the global identity to every point in the track
-        track_phenotypes = t.groupby("particle").apply(get_track_phenotype)
-        t["Track_Phenotype"] = t["particle"].map(track_phenotypes)
-
-        # Filter out the short noise tracks
         t_filtered = tp.filter_stubs(t, min_track_length)
 
         if t_filtered.empty:
-            print(
-                f"No tracks longer than {min_track_length} frames survived! Try lowering the threshold."
-            )
+            print(f"No tracks longer than {min_track_length} frames survived!")
             return
 
         # ---------------------------------------------------------
-        # 4. Strict Color Mapping (Fixes the White/Green bug)
+        # 4. Biological Target Logic (The Magic Step)
+        # ---------------------------------------------------------
+        def classify_retina_track(group):
+            # Find the last (highest Z) point of this track
+            max_z_row = group.loc[group["frame"].idxmax()]
+            end_pheno = max_z_row["Slice_Phenotype"]
+
+            # 1. Does it end as an Rh5 + Rh6 positive point?
+            if "Rh5" in end_pheno and "Rh6" in end_pheno:
+                # 2. Look behind it (all lower Z frames for this exact track)
+                history = group[group["frame"] < max_z_row["frame"]]
+
+                # 3. Was Rh4 present anywhere in its history?
+                had_rh4 = any("Rh4" in pheno for pheno in history["Slice_Phenotype"])
+
+                if had_rh4:
+                    return "Target (Prior Rh4)"
+                else:
+                    return "Target (No Rh4)"
+
+            return "Other"
+
+        # Apply classification
+        track_phenotypes = t_filtered.groupby("particle").apply(classify_retina_track)
+        t_filtered["Track_Phenotype"] = t_filtered["particle"].map(track_phenotypes)
+
+        # Count the results to display in the terminal
+        counts = track_phenotypes.value_counts()
+        count_prior = counts.get("Target (Prior Rh4)", 0)
+        count_none = counts.get("Target (No Rh4)", 0)
+
+        print("\n" + "=" * 40)
+        print("📊 FINAL COUNT (Rh5 + Rh6 on last image)")
+        print("=" * 40)
+        print(f" -> With Rh4 behind: {count_prior}")
+        print(f" -> NO Rh4 behind:  {count_none}")
+        print("=" * 40 + "\n")
+
+        # ---------------------------------------------------------
+        # 5. Push to Viewer with Custom Colormap
         # ---------------------------------------------------------
         master_color_dict = {
-            "Green Only": "lime",
-            "Red Only": "red",
-            "Blue Only": "cyan",
-            "Green -> Red": "yellow",
-            "Blue -> Green": "dodgerblue",
-            "Blue -> Red": "magenta",
-            "Blue -> Green -> Red": "white",
-            "Unknown": "gray",
+            "Target (Prior Rh4)": "cyan",  # Highlighted visually
+            "Target (No Rh4)": "magenta",  # Highlighted visually
+            "Other": "gray",  # Faded into the background
         }
 
         active_phenos = t_filtered["Track_Phenotype"].unique().tolist()
         N = len(active_phenos)
 
-        # Force the property values onto a strict 0.0 to 1.0 scale
         if N == 1:
             pheno_float_list = [0.5] * len(t_filtered)
             c = transform_color(master_color_dict[active_phenos[0]])[0]
@@ -420,16 +404,12 @@ def main():
                 colors=rgba_colors, controls=controls, name="exact_cmap"
             )
 
-        # ---------------------------------------------------------
-        # 5. Push to Viewer
-        # ---------------------------------------------------------
         track_data = t_filtered[["particle", "frame", "y", "x"]].values
         track_props = {
             "Track_Phenotype": t_filtered["Track_Phenotype"].tolist(),
             "color_val": pheno_float_list,
         }
 
-        # Delete the old layer to avoid internal Napari state bugs
         if "Trajectories" in viewer.layers:
             viewer.layers.remove("Trajectories")
 
@@ -437,7 +417,6 @@ def main():
             track_data,
             properties=track_props,
             color_by="color_val",
-            # --- THE FIX: Use colormaps_dict, NOT colormap ---
             colormaps_dict={"color_val": custom_cmap},
             name="Trajectories",
             tail_width=4,
@@ -447,31 +426,21 @@ def main():
         # ---------------------------------------------------------
         # 6. Cleanup Original Point Layers
         # ---------------------------------------------------------
-        # We use the *Slice_Phenotype* here so we only put dots back where they actually existed
-        green_coords, red_coords, blue_coords = [], [], []
+        rh4_coords, rh6_coords, rh5_coords = [], [], []
         for _, row in t_filtered.iterrows():
-            z, y, x, slice_pheno = (
-                row["frame"],
-                row["y"],
-                row["x"],
-                row["Slice_Phenotype"],
-            )
-            coord = [z, y, x]
+            coord = [row["frame"], row["y"], row["x"]]
+            pheno = row["Slice_Phenotype"]
 
-            if "Green" in slice_pheno or slice_pheno == "Triple Positive":
-                green_coords.append(coord)
-            if "Red" in slice_pheno or slice_pheno == "Triple Positive":
-                red_coords.append(coord)
-            if "Blue" in slice_pheno or slice_pheno == "Triple Positive":
-                blue_coords.append(coord)
+            if "Rh4" in pheno:
+                rh4_coords.append(coord)
+            if "Rh6" in pheno:
+                rh6_coords.append(coord)
+            if "Rh5" in pheno:
+                rh5_coords.append(coord)
 
-        layer_green.data = np.array(green_coords) if green_coords else np.empty((0, 3))
-        layer_red.data = np.array(red_coords) if red_coords else np.empty((0, 3))
-        layer_blue.data = np.array(blue_coords) if blue_coords else np.empty((0, 3))
-
-        print(
-            f"--- Success! Generated {t_filtered['particle'].nunique()} 3D trajectories. ---\n"
-        )
+        layer_rh4.data = np.array(rh4_coords) if rh4_coords else np.empty((0, 3))
+        layer_rh6.data = np.array(rh6_coords) if rh6_coords else np.empty((0, 3))
+        layer_rh5.data = np.array(rh5_coords) if rh5_coords else np.empty((0, 3))
 
     @magicgui(
         call_button="Save Points to CSV",
@@ -488,15 +457,15 @@ def main():
         df_list = []
 
         # Harvest the data directly from the active layers
-        for layer, color_name in [
-            (layer_green, "Green"),
-            (layer_red, "Red"),
-            (layer_blue, "Blue"),
+        for layer, target_name in [
+            (layer_rh4, "Rh4"),
+            (layer_rh6, "Rh6"),
+            (layer_rh5, "Rh5"),
         ]:
             # Ensure the layer exists and has data before trying to extract it
             if layer is not None and len(layer.data) > 0:
                 df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
-                df["Channel"] = color_name
+                df["Channel"] = target_name
                 df_list.append(df)
 
         if df_list:
