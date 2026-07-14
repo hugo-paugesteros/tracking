@@ -157,7 +157,7 @@ def main():
         print("Success: Z-axis inverted. Cleared stale detections/tracks.")
 
     @thread_worker
-    def _run_detection(channels_to_process, roi_mask, diameter, minmass, threshold):
+    def _run_detection(channels_to_process, diameter, minmass, threshold):
         c_axis = len(da_raw.shape) - 3
 
         # Process each selected channel sequentially, off the UI thread
@@ -169,17 +169,18 @@ def main():
             # Instantly get the correct physical index from our global dictionary
             c_index = channel_map[ch]
 
-            # Safely extract for 3D or 4D
+            # Safely extract for 3D or 4D - always the full stack, so users can
+            # tune parameters while looking at any Z without losing points on
+            # other frames. Which Z's actually get used is decided later, at
+            # the Colocalize & Backtrack step.
             if c_axis == 1:
                 volume = da_raw.values[:, c_index, :, :]
             else:
                 volume = da_raw.values[c_index, :, :]
 
-            masked_volume = volume * roi_mask[np.newaxis, :, :]
-
             # Run Trackpy
             f = tp.batch(
-                masked_volume,
+                volume,
                 diameter=diameter,
                 minmass=minmass,
                 threshold=threshold,
@@ -204,18 +205,7 @@ def main():
         minmass: int = 700,
         threshold: int = 30,
     ):
-        print(f"\n--- Starting Batch Prediction: {target_channel} ---")
-
-        # 1. Generate the ROI Mask
-        size_y, size_x = da_raw.shape[-2], da_raw.shape[-1]
-
-        # If the user painted the ROI Labels layer, use it; otherwise process everything
-        if np.any(layer_roi.data):
-            print("Applying custom ROI from Labels layer...")
-            roi_mask = layer_roi.data.astype(bool)
-        else:
-            print("No ROI drawn. Processing the entire image...")
-            roi_mask = np.ones((size_y, size_x), dtype=bool)
+        print(f"\n--- Starting Batch Prediction: {target_channel} (all Z) ---")
 
         target_layers = {
             "Rh4": layer_rh4,
@@ -228,7 +218,7 @@ def main():
         else:
             channels_to_process = [target_channel]
 
-        # 2. Run detection on a background thread so the UI stays responsive
+        # Run detection on a background thread so the UI stays responsive
         def _update_layer(result):
             ch, new_coords = result
             target_layers[ch].data = new_coords
@@ -244,42 +234,34 @@ def main():
             print("--- Batch Prediction Complete! ---\n")
 
         predict_all_frames_widget.call_button.enabled = False
-        worker = _run_detection(
-            channels_to_process, roi_mask, diameter, minmass, threshold
-        )
+        worker = _run_detection(channels_to_process, diameter, minmass, threshold)
         worker.yielded.connect(_update_layer)
         worker.finished.connect(_on_finished)
         worker.start()
 
     @magicgui(
-        call_button="Link & Track Targets",
-        track_radius={"label": "Max Tracking Drift (px)", "max": 50},
+        call_button="Colocalize & Backtrack",
+        track_radius={"label": "Max Backtrack Drift (px)", "max": 50},
         merge_radius={
             "label": "Colocalization Radius (px)",
             "max": 20,
-            "tooltip": "Merge dots closer than this",
+            "tooltip": "Merge Rh5/Rh6 dots closer than this into one cell",
         },
         memory={
             "label": "Memory (frames)",
             "max": 5,
-            "tooltip": "Max frames a cell can disappear and be remembered",
-        },
-        min_track_length={
-            "label": "Min Track Length",
-            "max": 11,
-            "tooltip": "Delete noise! Tracks shorter than this are removed.",
+            "tooltip": "Max consecutive frames a cell can go undetected while backtracking",
         },
     )
     def link_and_track_widget(
         track_radius: int = 15,
         merge_radius: float = 5.0,
         memory: int = 1,
-        min_track_length: int = 3,
     ):
-        print("\n--- Starting Colocalization & Tracking ---")
+        print("\n--- Colocalizing at the last Z and backtracking to origin ---")
 
         # ---------------------------------------------------------
-        # 1. Harvest Data using new Rh Layer Names
+        # 1. Harvest raw per-channel detections
         # ---------------------------------------------------------
         df_list = []
         for layer, target_name in [
@@ -297,130 +279,179 @@ def main():
             return
 
         df_all = pd.concat(df_list, ignore_index=True)
+        df_all["Z"] = df_all["Z"].round().astype(int)
 
         # ---------------------------------------------------------
-        # 2. Spatial Deduplication (Colocalization per Slice)
+        # 2. Colocalize Rh5/Rh6 at the last useful Z, inside the ROI
         # ---------------------------------------------------------
-        merged_points = []
-        for z, group in df_all.groupby("Z"):
-            pts = group[["Y", "X"]].values
-            targets = group["target"].values
+        # Whatever Z the user is currently viewing is the last useful frame -
+        # navigate there (where Rh5/Rh6 are clearest) before clicking this.
+        # Detection already ran on the full stack, so this is purely an
+        # analysis-time cutoff; deeper frames are simply never looked at.
+        z_max = int(viewer.dims.current_step[0])
+        end_df = df_all[
+            (df_all["Z"] == z_max) & (df_all["target"].isin(["Rh5", "Rh6"]))
+        ]
 
+        if np.any(layer_roi.data):
+            roi_mask = layer_roi.data.astype(bool)
+            yy = np.clip(end_df["Y"].round().astype(int), 0, roi_mask.shape[0] - 1)
+            xx = np.clip(end_df["X"].round().astype(int), 0, roi_mask.shape[1] - 1)
+            end_df = end_df[roi_mask[yy, xx]]
+            print(f"Seeding from Z={z_max}, restricted to the drawn ROI.")
+        else:
+            print(f"Seeding from Z={z_max}. No ROI drawn - using the entire slice.")
+
+        seeds = []
+        if not end_df.empty:
+            pts = end_df[["Y", "X"]].values
+            labels = end_df["target"].values
             tree = cKDTree(pts)
             clusters = tree.query_ball_tree(tree, r=merge_radius)
 
-            processed_indices = set()
+            processed = set()
             for i, neighbors in enumerate(clusters):
-                if i in processed_indices:
+                if i in processed:
                     continue
-                for n in neighbors:
-                    processed_indices.add(n)
+                processed.update(neighbors)
 
-                mean_y, mean_x = np.mean(pts[neighbors, 0]), np.mean(pts[neighbors, 1])
+                cluster_targets = set(labels[neighbors])
+                if "Rh5" in cluster_targets and "Rh6" in cluster_targets:
+                    phenotype = "Rh5+Rh6"
+                elif "Rh5" in cluster_targets:
+                    phenotype = "Rh5"
+                else:
+                    phenotype = "Rh6"
 
-                # Elegantly join the targets into a single string (e.g. "Rh4 + Rh5")
-                cluster_targets = set(targets[neighbors])
-                slice_pheno = " + ".join(sorted(list(cluster_targets)))
-
-                merged_points.append(
+                seeds.append(
                     {
-                        "frame": int(z),
-                        "y": mean_y,
-                        "x": mean_x,
-                        "Slice_Phenotype": slice_pheno,
+                        "y": float(np.mean(pts[neighbors, 0])),
+                        "x": float(np.mean(pts[neighbors, 1])),
+                        "phenotype": phenotype,
+                        # Raw detections making up this cluster, for the
+                        # point-layer cleanup below
+                        "z_points": [
+                            (pts[n, 0], pts[n, 1], labels[n]) for n in neighbors
+                        ],
                     }
                 )
 
-        df_merged = pd.DataFrame(merged_points)
-
-        # ---------------------------------------------------------
-        # 3. Track & Filter
-        # ---------------------------------------------------------
-        if df_merged.empty:
+        if not seeds:
+            print("No Rh5/Rh6 points found at the last Z (inside the ROI).\n")
             return
 
-        tp.quiet()
-        t = tp.link(df_merged, search_range=track_radius, memory=memory)
-        t_filtered = tp.filter_stubs(t, min_track_length)
+        # ---------------------------------------------------------
+        # 3. Backtrack each seed frame-by-frame down to Z=0
+        # ---------------------------------------------------------
+        # Backtracking is unrestricted by the ROI - a cell's origin (an Rh4
+        # point, or nothing observed = Rh3) can lie outside the footprint
+        # drawn at the last Z, since cells drift as they differentiate.
+        points_by_z = {z: g[["Y", "X"]].values for z, g in df_all.groupby("Z")}
+        targets_by_z = {z: g["target"].values for z, g in df_all.groupby("Z")}
 
-        if t_filtered.empty:
-            print(f"No tracks longer than {min_track_length} frames survived!")
-            return
+        # Collect the raw per-channel points that actually belong to a
+        # surviving trajectory, so the Points layers can be cleaned up below
+        channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
 
-        # tp.filter_stubs indexes the result by "frame" while also keeping it
-        # as a column, which makes that name ambiguous to pandas - drop the
-        # index first. napari's Tracks layer then needs data sorted by track
-        # id then time.
-        t_filtered = t_filtered.reset_index(drop=True)
-        t_filtered = t_filtered.sort_values(["particle", "frame"]).reset_index(
-            drop=True
-        )
+        results = []
+        for seed in seeds:
+            cur_y, cur_x = seed["y"], seed["x"]
+            path = [(z_max, cur_y, cur_x)]
+            missed = 0
+            origin = "Rh3"  # default: trail never confirms an Rh4 point
+
+            for y, x, target in seed["z_points"]:
+                channel_points[target].append((z_max, y, x))
+
+            for z in range(z_max - 1, -1, -1):
+                pts = points_by_z.get(z)
+                found = False
+                if pts is not None and len(pts):
+                    dists = np.hypot(pts[:, 0] - cur_y, pts[:, 1] - cur_x)
+                    j = int(np.argmin(dists))
+                    if dists[j] <= track_radius:
+                        cur_y, cur_x = pts[j]
+                        path.append((z, cur_y, cur_x))
+                        missed = 0
+                        found = True
+                        target = targets_by_z[z][j]
+                        channel_points[target].append((z, cur_y, cur_x))
+                        if z == 0 and target == "Rh4":
+                            origin = "Rh4"
+
+                if not found:
+                    missed += 1
+                    if missed > memory:
+                        break  # trail went cold before reaching Z=0 -> Rh3
+
+            results.append(
+                {
+                    "phenotype": seed["phenotype"],
+                    "label": f"{origin} -> {seed['phenotype']}",
+                    "path": path,
+                }
+            )
+
+        # Drop every detection that isn't part of a surviving trajectory
+        for target_name, layer in (
+            ("Rh4", layer_rh4),
+            ("Rh5", layer_rh5),
+            ("Rh6", layer_rh6),
+        ):
+            coords = channel_points[target_name]
+            layer.data = np.array(coords) if coords else np.empty((0, 3))
 
         # ---------------------------------------------------------
-        # 4. Biological Target Logic (The Magic Step)
+        # 4. Report counts
         # ---------------------------------------------------------
-        def classify_retina_track(group):
-            # Was Rh4 present anywhere along this track's history?
-            had_rh4 = any("Rh4" in pheno for pheno in group["Slice_Phenotype"])
-            if not had_rh4:
-                return "Other"
-
-            # What does it end up as (last/highest Z point of the track)?
-            end_pheno = group.loc[group["frame"].idxmax(), "Slice_Phenotype"]
-            has_rh5 = "Rh5" in end_pheno
-            has_rh6 = "Rh6" in end_pheno
-
-            if has_rh5 and has_rh6:
-                return "Rh4 -> Rh5+Rh6"
-            elif has_rh5:
-                return "Rh4 -> Rh5"
-            elif has_rh6:
-                return "Rh4 -> Rh6"
-
-            return "Other"
-
-        # Apply classification
-        track_phenotypes = t_filtered.groupby("particle").apply(classify_retina_track)
-        t_filtered["Track_Phenotype"] = t_filtered["particle"].map(track_phenotypes)
-
-        # Count the results to display in the terminal
-        counts = track_phenotypes.value_counts()
-        count_rh5 = counts.get("Rh4 -> Rh5", 0)
-        count_rh6 = counts.get("Rh4 -> Rh6", 0)
-        count_both = counts.get("Rh4 -> Rh5+Rh6", 0)
+        counts = pd.Series([r["label"] for r in results]).value_counts()
+        categories = [
+            "Rh4 -> Rh5",
+            "Rh4 -> Rh6",
+            "Rh4 -> Rh5+Rh6",
+            "Rh3 -> Rh5",
+            "Rh3 -> Rh6",
+            "Rh3 -> Rh5+Rh6",
+        ]
 
         print("\n" + "=" * 40)
-        print("📊 FINAL COUNT (originating from Rh4)")
+        print(f"📊 FINAL COUNT (colocalized at Z={z_max}, backtracked to origin)")
         print("=" * 40)
-        print(f" -> Rh4 -> Rh5 only:    {count_rh5}")
-        print(f" -> Rh4 -> Rh6 only:    {count_rh6}")
-        print(f" -> Rh4 -> Rh5 + Rh6:   {count_both}")
+        for cat in categories:
+            print(f" -> {cat:<16}: {counts.get(cat, 0)}")
         print("=" * 40 + "\n")
 
         # ---------------------------------------------------------
-        # 5. Push to Viewer with Custom Colormap
+        # 5. Push backtracked paths to the viewer as Tracks
         # ---------------------------------------------------------
         master_color_dict = {
             "Rh4 -> Rh5": "cyan",
             "Rh4 -> Rh6": "magenta",
             "Rh4 -> Rh5+Rh6": "yellow",
-            "Other": "gray",  # Faded into the background
+            "Rh3 -> Rh5": "steelblue",
+            "Rh3 -> Rh6": "orchid",
+            "Rh3 -> Rh5+Rh6": "khaki",
         }
-
-        # Only display tracks that actually trace back to Rh4 - "Other" tracks
-        # would just clutter the Trajectories layer with lines nobody is counting
-        n_hidden = int((t_filtered["Track_Phenotype"] == "Other").sum())
-        t_display = t_filtered[t_filtered["Track_Phenotype"] != "Other"].reset_index(
-            drop=True
-        )
-        print(f" -> Hiding {n_hidden} non-Rh4-derived track point(s).\n")
 
         if "Trajectories" in viewer.layers:
             viewer.layers.remove("Trajectories")
 
-        if t_display.empty:
-            print("No Rh4-derived tracks to display.\n")
-            return
+        track_rows = [
+            {
+                "particle": idx,
+                "frame": z,
+                "y": y,
+                "x": x,
+                "Track_Phenotype": r["label"],
+            }
+            for idx, r in enumerate(results)
+            for (z, y, x) in r["path"]
+        ]
+        t_display = (
+            pd.DataFrame(track_rows)
+            .sort_values(["particle", "frame"])
+            .reset_index(drop=True)
+        )
 
         active_phenos = t_display["Track_Phenotype"].unique().tolist()
         N = len(active_phenos)
@@ -458,90 +489,8 @@ def main():
             colormaps_dict={"color_val": custom_cmap},
             name="Trajectories",
             tail_width=4,
-            tail_length=max(3, memory + 2),
+            tail_length=z_max + 5,
         )
-
-        # ---------------------------------------------------------
-        # 6. Cleanup Original Point Layers
-        # ---------------------------------------------------------
-        rh4_coords, rh6_coords, rh5_coords = [], [], []
-        for _, row in t_filtered.iterrows():
-            coord = [row["frame"], row["y"], row["x"]]
-            pheno = row["Slice_Phenotype"]
-
-            if "Rh4" in pheno:
-                rh4_coords.append(coord)
-            if "Rh6" in pheno:
-                rh6_coords.append(coord)
-            if "Rh5" in pheno:
-                rh5_coords.append(coord)
-
-        layer_rh4.data = np.array(rh4_coords) if rh4_coords else np.empty((0, 3))
-        layer_rh6.data = np.array(rh6_coords) if rh6_coords else np.empty((0, 3))
-        layer_rh5.data = np.array(rh5_coords) if rh5_coords else np.empty((0, 3))
-
-    @magicgui(
-        call_button="Count Rh5/Rh6 at Current Z",
-        merge_radius={
-            "label": "Colocalization Radius (px)",
-            "max": 20,
-            "tooltip": "Merge dots closer than this",
-        },
-    )
-    def count_at_z_widget(merge_radius: float = 5.0):
-        if da_raw is None:
-            print("Please load an image first.")
-            return
-
-        # Whatever Z the user is currently viewing is the Z they drew the ROI on
-        z = int(viewer.dims.current_step[0])
-        print(f"\n--- Counting Rh5/Rh6 at Z={z} ---")
-
-        if np.any(layer_roi.data):
-            roi_mask = layer_roi.data.astype(bool)
-            print("Restricting to the drawn ROI.")
-        else:
-            size_y, size_x = da_raw.shape[-2], da_raw.shape[-1]
-            roi_mask = np.ones((size_y, size_x), dtype=bool)
-            print("No ROI drawn. Counting the entire slice.")
-
-        def _points_at_z(layer):
-            data = layer.data
-            if len(data) == 0:
-                return np.empty((0, 2))
-            in_slice = np.round(data[:, 0]).astype(int) == z
-            pts = data[in_slice][:, 1:3]  # Y, X
-            if len(pts):
-                yy = np.clip(np.round(pts[:, 0]).astype(int), 0, roi_mask.shape[0] - 1)
-                xx = np.clip(np.round(pts[:, 1]).astype(int), 0, roi_mask.shape[1] - 1)
-                pts = pts[roi_mask[yy, xx]]
-            return pts
-
-        rh5_pts = _points_at_z(layer_rh5)
-        rh6_pts = _points_at_z(layer_rh6)
-        n_rh5 = len(rh5_pts)
-        n_rh6 = len(rh6_pts)
-
-        # Colocalize Rh5 & Rh6 at this single Z, same merge logic used for tracking
-        n_coloc = 0
-        if n_rh5 and n_rh6:
-            all_pts = np.vstack([rh5_pts, rh6_pts])
-            channels = ["Rh5"] * n_rh5 + ["Rh6"] * n_rh6
-            tree = cKDTree(all_pts)
-            clusters = tree.query_ball_tree(tree, r=merge_radius)
-            processed = set()
-            for i, neighbors in enumerate(clusters):
-                if i in processed:
-                    continue
-                processed.update(neighbors)
-                cluster_channels = {channels[n] for n in neighbors}
-                if "Rh5" in cluster_channels and "Rh6" in cluster_channels:
-                    n_coloc += 1
-
-        print(f" -> Rh5:       {n_rh5}")
-        print(f" -> Rh6:       {n_rh6}")
-        print(f" -> Rh5 + Rh6: {n_coloc}")
-        print("-" * 40 + "\n")
 
     @magicgui(
         call_button="Save Points to CSV",
@@ -596,13 +545,10 @@ def main():
         predict_all_frames_widget, name="2. Point detection", area="right"
     )
     viewer.window.add_dock_widget(
-        link_and_track_widget, name="3. Tracking & Colocalization", area="right"
+        link_and_track_widget, name="3. Colocalize & Backtrack", area="right"
     )
     viewer.window.add_dock_widget(
-        count_at_z_widget, name="4. Count ROI at Z", area="right"
-    )
-    viewer.window.add_dock_widget(
-        export_points_widget, name="5. Export Results", area="right"
+        export_points_widget, name="4. Export Results", area="right"
     )
 
     napari.run()
