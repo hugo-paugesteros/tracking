@@ -33,7 +33,14 @@ pip install -e .
 
 
 ## How to run
-Every time you want to use the tool, just open your terminal, activate your environment (Step 3), and type:
+Every time you want to use the tool, double-click one of these in the `tracking` folder:
+- **Mac**: `launch_tracker.command`
+- **Windows**: `launch_tracker.bat`
+- **Linux**: `launch_tracker.sh` (if double-clicking doesn't run it, right-click it and choose "Run" or "Run as a Program")
+
+A terminal window will open and stay open - if anything goes wrong, the error message will be there so you can copy it for a bug report (see below).
+
+Alternatively, you can still open your terminal, activate your environment (Step 3), and type:
 ```bash
 launch-tracker
 ```
