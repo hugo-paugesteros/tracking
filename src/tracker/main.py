@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 from napari.utils.colormaps import Colormap
 from napari.utils.color import transform_color
 from napari.qt.threading import thread_worker
+import xml.etree.ElementTree as ET
 
 from collections.abc import Sequence
 from pathlib import Path
@@ -72,14 +73,25 @@ def main():
 
             try:
                 c_metadata = da_raw.coords["C"].values
-                channel_map = {
-                    "Rh4": np.where(c_metadata == "ALEXA 488")[0][0],
-                    "Rh6": np.where(c_metadata == "ALEXA 555")[0][0],
-                    "Rh5": np.where(c_metadata == "ALEXA 647")[0][0],
-                }
-            except Exception:
-                print("Warning: Channel metadata not found. Using default order.")
+                if "Profile 1" in color_profile:
+                    channel_map = {
+                        "Rh4": np.where(c_metadata == "ALEXA 488")[0][0],  # Green
+                        "Rh6": np.where(c_metadata == "ALEXA 555")[0][0],  # Red
+                        "Rh5": np.where(c_metadata == "ALEXA 647")[0][0],  # Blue
+                    }
+                else:
+                    channel_map = {
+                        "Rh4": np.where(c_metadata == "ALEXA 647")[0][0],
+                        "Rh6": np.where(c_metadata == "ALEXA 488")[0][0],
+                        "Rh5": np.where(c_metadata == "ALEXA 555")[0][0],
+                    }
+            except Exception as e:
+                print(
+                    f"Warning: Channel metadata lookup failed ({e}). Using default order."
+                )
                 channel_map = {"Rh4": 0, "Rh6": 1, "Rh5": 2}
+
+            print(channel_map)
 
             names_in_order = [""] * 3
             for target, idx in channel_map.items():
@@ -178,6 +190,19 @@ def main():
             else:
                 volume = da_raw.values[c_index, :, :]
 
+            if volume.ndim == 2:
+                # No Z axis (single 2D image): unlike a multi-Z stack, there's
+                # no "cell drifted outside the ROI at an earlier Z" concern
+                # here - it's the same one slice for every channel - so it's
+                # safe (and desired) to restrict detection itself to the ROI,
+                # rather than relying on later steps to filter it out.
+                roi_data = np.asarray(layer_roi.data)
+                if np.any(roi_data):
+                    volume = volume * roi_data.astype(bool)
+                # trackpy.batch still needs a leading frame axis to iterate
+                # over, even if there's only one
+                volume = volume[np.newaxis, :, :]
+
             # Run Trackpy
             f = tp.batch(
                 volume,
@@ -239,56 +264,22 @@ def main():
         worker.finished.connect(_on_finished)
         worker.start()
 
-    @magicgui(
-        call_button="Colocalize & Backtrack",
-        track_radius={"label": "Max Backtrack Drift (px)", "max": 50},
-        merge_radius={
-            "label": "Colocalization Radius (px)",
-            "max": 20,
-            "tooltip": "Merge Rh5/Rh6 dots closer than this into one cell",
-        },
-        memory={
-            "label": "Memory (frames)",
-            "max": 5,
-            "tooltip": "Max consecutive frames a cell can go undetected while backtracking",
-        },
-    )
-    def link_and_track_widget(
-        track_radius: int = 15,
-        merge_radius: float = 5.0,
-        memory: int = 1,
-    ):
-        print("\n--- Colocalizing at the last Z and backtracking to origin ---")
+    def _compute_transitions(df_all, z_max, track_radius, merge_radius, memory):
+        """Colocalize Rh5/Rh6 at z_max (inside the ROI drawn on that slice),
+        then, for multi-Z stacks, backtrack each colocalized point toward
+        Z=0 to determine whether it originates from an Rh4 point or from
+        nothing observed (Rh3). Single-slice images (z_max == 0) have no
+        lower Z to backtrack through, so "origin" stays None for them -
+        only the raw colocalization is meaningful, not a transition.
 
-        # ---------------------------------------------------------
-        # 1. Harvest raw per-channel detections
-        # ---------------------------------------------------------
-        df_list = []
-        for layer, target_name in [
-            (layer_rh4, "Rh4"),
-            (layer_rh6, "Rh6"),
-            (layer_rh5, "Rh5"),
-        ]:
-            if len(layer.data) > 0:
-                df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
-                df["target"] = target_name
-                df_list.append(df)
-
-        if not df_list:
-            print("No points found in any layer. Run prediction first.")
-            return
-
-        df_all = pd.concat(df_list, ignore_index=True)
-        df_all["Z"] = df_all["Z"].round().astype(int)
-
-        # ---------------------------------------------------------
-        # 2. Colocalize Rh5/Rh6 at the last useful Z, inside the ROI
-        # ---------------------------------------------------------
-        # Whatever Z the user is currently viewing is the last useful frame -
-        # navigate there (where Rh5/Rh6 are clearest) before clicking this.
-        # Detection already ran on the full stack, so this is purely an
-        # analysis-time cutoff; deeper frames are simply never looked at.
-        z_max = int(viewer.dims.current_step[0])
+        Returns (seeds, results, channel_points):
+        - seeds: the Rh5/Rh6 clusters found at z_max
+        - results: one dict per seed with "phenotype" (Rh5/Rh6/Rh5+Rh6),
+          "origin" ("Rh4"/"Rh3"/None), and "path" ((z, y, x) tuples,
+          seed frame first)
+        - channel_points: {"Rh4"/"Rh5"/"Rh6": [(z, y, x), ...]} - every raw
+          detection that is part of a surviving seed or backtrack path
+        """
         end_df = df_all[
             (df_all["Z"] == z_max) & (df_all["target"].isin(["Rh5", "Rh6"]))
         ]
@@ -298,9 +289,6 @@ def main():
             yy = np.clip(end_df["Y"].round().astype(int), 0, roi_mask.shape[0] - 1)
             xx = np.clip(end_df["X"].round().astype(int), 0, roi_mask.shape[1] - 1)
             end_df = end_df[roi_mask[yy, xx]]
-            print(f"Seeding from Z={z_max}, restricted to the drawn ROI.")
-        else:
-            print(f"Seeding from Z={z_max}. No ROI drawn - using the entire slice.")
 
         seeds = []
         if not end_df.empty:
@@ -328,30 +316,36 @@ def main():
                         "y": float(np.mean(pts[neighbors, 0])),
                         "x": float(np.mean(pts[neighbors, 1])),
                         "phenotype": phenotype,
-                        # Raw detections making up this cluster, for the
-                        # point-layer cleanup below
                         "z_points": [
                             (pts[n, 0], pts[n, 1], labels[n]) for n in neighbors
                         ],
                     }
                 )
 
+        channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
         if not seeds:
-            print("No Rh5/Rh6 points found at the last Z (inside the ROI).\n")
-            return
+            return seeds, [], channel_points
 
-        # ---------------------------------------------------------
-        # 3. Backtrack each seed frame-by-frame down to Z=0
-        # ---------------------------------------------------------
+        for seed in seeds:
+            for y, x, target in seed["z_points"]:
+                channel_points[target].append((z_max, y, x))
+
+        if z_max == 0:
+            results = [
+                {
+                    "phenotype": s["phenotype"],
+                    "origin": None,
+                    "path": [(z_max, s["y"], s["x"])],
+                }
+                for s in seeds
+            ]
+            return seeds, results, channel_points
+
         # Backtracking is unrestricted by the ROI - a cell's origin (an Rh4
         # point, or nothing observed = Rh3) can lie outside the footprint
         # drawn at the last Z, since cells drift as they differentiate.
         points_by_z = {z: g[["Y", "X"]].values for z, g in df_all.groupby("Z")}
         targets_by_z = {z: g["target"].values for z, g in df_all.groupby("Z")}
-
-        # Collect the raw per-channel points that actually belong to a
-        # surviving trajectory, so the Points layers can be cleaned up below
-        channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
 
         results = []
         for seed in seeds:
@@ -359,9 +353,6 @@ def main():
             path = [(z_max, cur_y, cur_x)]
             missed = 0
             origin = "Rh3"  # default: trail never confirms an Rh4 point
-
-            for y, x, target in seed["z_points"]:
-                channel_points[target].append((z_max, y, x))
 
             for z in range(z_max - 1, -1, -1):
                 pts = points_by_z.get(z)
@@ -385,44 +376,116 @@ def main():
                         break  # trail went cold before reaching Z=0 -> Rh3
 
             results.append(
-                {
-                    "phenotype": seed["phenotype"],
-                    "label": f"{origin} -> {seed['phenotype']}",
-                    "path": path,
-                }
+                {"phenotype": seed["phenotype"], "origin": origin, "path": path}
             )
 
-        # Drop every detection that isn't part of a surviving trajectory
-        for target_name, layer in (
-            ("Rh4", layer_rh4),
-            ("Rh5", layer_rh5),
-            ("Rh6", layer_rh6),
-        ):
+        return seeds, results, channel_points
+
+    @magicgui(
+        call_button="Colocalize & Backtrack",
+        track_radius={"label": "Max Backtrack Drift (px)", "max": 50},
+        merge_radius={
+            "label": "Colocalization Radius (px)",
+            "max": 20,
+            "tooltip": "Merge Rh5/Rh6 dots closer than this into one cell",
+        },
+        memory={
+            "label": "Memory (frames)",
+            "max": 5,
+            "tooltip": "Max consecutive frames a cell can go undetected while backtracking",
+        },
+    )
+    def link_and_track_widget(
+        track_radius: int = 15,
+        merge_radius: float = 5.0,
+        memory: int = 1,
+    ):
+        print("\n--- Colocalizing at the last Z and backtracking to origin ---")
+
+        df_list = []
+        for layer, target_name in [
+            (layer_rh4, "Rh4"),
+            (layer_rh6, "Rh6"),
+            (layer_rh5, "Rh5"),
+        ]:
+            if len(layer.data) > 0:
+                df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
+                df["target"] = target_name
+                df_list.append(df)
+
+        if not df_list:
+            print("No points found in any layer. Run prediction first.")
+            return
+
+        df_all = pd.concat(df_list, ignore_index=True)
+        df_all["Z"] = df_all["Z"].round().astype(int)
+
+        # Whatever Z the user is currently viewing is the last useful frame -
+        # navigate there (where Rh5/Rh6 are clearest) before clicking this.
+        z_max = int(viewer.dims.current_step[0])
+        if np.any(layer_roi.data):
+            print(f"Seeding from Z={z_max}, restricted to the drawn ROI.")
+        else:
+            print(f"Seeding from Z={z_max}. No ROI drawn - using the entire slice.")
+
+        seeds, results, channel_points = _compute_transitions(
+            df_all, z_max, track_radius, merge_radius, memory
+        )
+
+        if not seeds:
+            print("No Rh5/Rh6 points found at the last Z (inside the ROI).\n")
+            return
+
+        single_slice = z_max == 0
+        if single_slice:
+            print(
+                "Single-slice image: no lower Z to backtrack through, so Rh4/Rh3 "
+                "origin can't be determined - showing raw colocalization only."
+            )
+        for r in results:
+            r["label"] = (
+                r["phenotype"]
+                if single_slice
+                else f"{r['origin']} -> {r['phenotype']}"
+            )
+
+        # Keep only the points that belong to a surviving Rh5/Rh6 seed (and, for
+        # multi-Z stacks, a confirmed backtrack path). A single slice can't say
+        # anything about Rh4's relevance, so its points are left untouched.
+        layers_to_clean = [("Rh5", layer_rh5), ("Rh6", layer_rh6)]
+        if not single_slice:
+            layers_to_clean.append(("Rh4", layer_rh4))
+        for target_name, layer in layers_to_clean:
             coords = channel_points[target_name]
             layer.data = np.array(coords) if coords else np.empty((0, 3))
 
         # ---------------------------------------------------------
-        # 4. Report counts
+        # Report counts
         # ---------------------------------------------------------
         counts = pd.Series([r["label"] for r in results]).value_counts()
-        categories = [
-            "Rh4 -> Rh5",
-            "Rh4 -> Rh6",
-            "Rh4 -> Rh5+Rh6",
-            "Rh3 -> Rh5",
-            "Rh3 -> Rh6",
-            "Rh3 -> Rh5+Rh6",
-        ]
+        if single_slice:
+            categories = ["Rh5", "Rh6", "Rh5+Rh6"]
+            header = f"📊 FINAL COUNT (colocalized at Z={z_max})"
+        else:
+            categories = [
+                "Rh4 -> Rh5",
+                "Rh4 -> Rh6",
+                "Rh4 -> Rh5+Rh6",
+                "Rh3 -> Rh5",
+                "Rh3 -> Rh6",
+                "Rh3 -> Rh5+Rh6",
+            ]
+            header = f"📊 FINAL COUNT (colocalized at Z={z_max}, backtracked to origin)"
 
         print("\n" + "=" * 40)
-        print(f"📊 FINAL COUNT (colocalized at Z={z_max}, backtracked to origin)")
+        print(header)
         print("=" * 40)
         for cat in categories:
             print(f" -> {cat:<16}: {counts.get(cat, 0)}")
         print("=" * 40 + "\n")
 
         # ---------------------------------------------------------
-        # 5. Push backtracked paths to the viewer as Tracks
+        # Push results to the viewer as Tracks
         # ---------------------------------------------------------
         master_color_dict = {
             "Rh4 -> Rh5": "cyan",
@@ -431,6 +494,9 @@ def main():
             "Rh3 -> Rh5": "steelblue",
             "Rh3 -> Rh6": "orchid",
             "Rh3 -> Rh5+Rh6": "khaki",
+            "Rh5": "cyan",
+            "Rh6": "magenta",
+            "Rh5+Rh6": "yellow",
         }
 
         if "Trajectories" in viewer.layers:
@@ -464,9 +530,7 @@ def main():
             pheno_to_float = {
                 pheno: float(i) / (N - 1) for i, pheno in enumerate(active_phenos)
             }
-            pheno_float_list = [
-                pheno_to_float[p] for p in t_display["Track_Phenotype"]
-            ]
+            pheno_float_list = [pheno_to_float[p] for p in t_display["Track_Phenotype"]]
 
             rgba_colors = [
                 transform_color(master_color_dict[k])[0] for k in active_phenos
@@ -536,6 +600,130 @@ def main():
         else:
             print("Export failed: No points found in any of the layers.")
 
+    @magicgui(
+        call_button="Export to ImageJ Cell Counter",
+        save_path={"label": "Save Location:", "mode": "w", "filter": "*.xml"},
+    )
+    def export_cellcounter_widget(
+        save_path: Path = Path("cell_counter_export.xml"),
+    ):
+        print("\n--- Exporting to ImageJ Cell Counter ---")
+
+        if da_raw is None:
+            print("Please load an image first.")
+            return
+
+        if save_path is None:
+            print("Export canceled: No save path selected.")
+            return
+
+        markers = {t: [] for t in range(1, 9)}
+
+        def _add(marker_type, z, y, x):
+            # ImageJ Z slices are 1-indexed; ours are 0-indexed
+            markers[marker_type].append(
+                (int(round(x)), int(round(y)), int(round(z)) + 1)
+            )
+
+        # Types 4/5/6: raw points, straight from the layers
+        for layer, marker_type in [(layer_rh4, 4), (layer_rh5, 5), (layer_rh6, 6)]:
+            for z, y, x in layer.data:
+                _add(marker_type, z, y, x)
+
+        # Types 1/2/3/7 need colocalization/backtracking, reusing the exact
+        # same computation as "Colocalize & Backtrack" (and whatever
+        # parameters are currently set on that panel), but without touching
+        # any layers - this works standalone, without that button having
+        # been clicked first.
+        df_list = []
+        for layer, target_name in [
+            (layer_rh4, "Rh4"),
+            (layer_rh6, "Rh6"),
+            (layer_rh5, "Rh5"),
+        ]:
+            if len(layer.data) > 0:
+                df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
+                df["target"] = target_name
+                df_list.append(df)
+
+        if df_list:
+            df_all = pd.concat(df_list, ignore_index=True)
+            df_all["Z"] = df_all["Z"].round().astype(int)
+            z_max = int(viewer.dims.current_step[0])
+
+            _, results, _ = _compute_transitions(
+                df_all,
+                z_max,
+                link_and_track_widget.track_radius.value,
+                link_and_track_widget.merge_radius.value,
+                link_and_track_widget.memory.value,
+            )
+
+            for r in results:
+                z_end, y_end, x_end = r["path"][0]
+                if r["phenotype"] == "Rh5+Rh6":
+                    _add(7, z_end, y_end, x_end)
+                    if r["origin"] == "Rh4":
+                        _add(2, z_end, y_end, x_end)
+                    elif r["origin"] == "Rh3":
+                        _add(3, z_end, y_end, x_end)
+                elif r["phenotype"] == "Rh5" and r["origin"] == "Rh4":
+                    _add(1, z_end, y_end, x_end)
+
+        # Physical calibration is purely informational here - marker
+        # coordinates stay in pixels, matching ImageJ's own convention
+        def _spacing(dim):
+            coord = da_raw.coords.get(dim)
+            if coord is not None and len(coord) > 1:
+                return float(abs(coord[1] - coord[0]))
+            return 1.0
+
+        image_filename = da_raw.attrs.get("path", da_raw.attrs.get("name", "unknown"))
+
+        root = ET.Element("CellCounter_Marker_File")
+        img_props = ET.SubElement(root, "Image_Properties")
+        ET.SubElement(img_props, "Image_Filename").text = str(image_filename)
+        ET.SubElement(img_props, "X_Calibration").text = str(_spacing("X"))
+        ET.SubElement(img_props, "Y_Calibration").text = str(_spacing("Y"))
+        ET.SubElement(img_props, "Z_Calibration").text = str(_spacing("Z"))
+        ET.SubElement(img_props, "Calibration_Unit").text = "micron"
+
+        marker_data = ET.SubElement(root, "Marker_Data")
+        ET.SubElement(marker_data, "Current_Type").text = "1"
+
+        for t in range(1, 9):
+            mt = ET.SubElement(marker_data, "Marker_Type")
+            ET.SubElement(mt, "Type").text = str(t)
+            ET.SubElement(mt, "Name").text = f"Type {t}"
+            for x, y, z in markers[t]:
+                m = ET.SubElement(mt, "Marker")
+                ET.SubElement(m, "MarkerX").text = str(x)
+                ET.SubElement(m, "MarkerY").text = str(y)
+                ET.SubElement(m, "MarkerZ").text = str(z)
+
+        if save_path.suffix != ".xml":
+            save_path = save_path.with_suffix(".xml")
+
+        ET.indent(root, space="    ")
+        ET.ElementTree(root).write(save_path, encoding="UTF-8", xml_declaration=True)
+
+        type_labels = {
+            1: "Rh4 -> Rh5",
+            2: "Rh4 -> Rh5+Rh6",
+            3: "nothing(Rh3) -> Rh5+Rh6",
+            4: "Rh4 points",
+            5: "Rh5 points",
+            6: "Rh6 points",
+            7: "Rh5+Rh6 points",
+            8: "(unused)",
+        }
+        print("Success! Saved Cell Counter markers to:")
+        print(f" -> {save_path.absolute()}")
+        print("\nMarker counts by type:")
+        for t in range(1, 9):
+            print(f"  Type {t} ({type_labels[t]}): {len(markers[t])}")
+        print("----------------------------\n")
+
     # Swap out or add this widget to the sidebar
     viewer.window.add_dock_widget(filepicker, name="1. Load File", area="right")
     viewer.window.add_dock_widget(
@@ -549,6 +737,9 @@ def main():
     )
     viewer.window.add_dock_widget(
         export_points_widget, name="4. Export Results", area="right"
+    )
+    viewer.window.add_dock_widget(
+        export_cellcounter_widget, name="5. Export to ImageJ", area="right"
     )
 
     napari.run()
