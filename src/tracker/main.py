@@ -81,7 +81,6 @@ def main():
     # Origin". Kept separate from any UI widget so both can read/reset it.
     last_colocalization: dict[str, Any] = {
         "seeds": [],
-        "channel_points": {"Rh4": [], "Rh5": [], "Rh6": []},
         "z": None,
         "coloc_count": None,
         "trajectory_counts": None,
@@ -169,7 +168,6 @@ def main():
             layer_rh5.data = np.empty((0, 3))
             layer_rh6.data = np.empty((0, 3))
             last_colocalization["seeds"] = []
-            last_colocalization["channel_points"] = {"Rh4": [], "Rh5": [], "Rh6": []}
             last_colocalization["z"] = None
             last_colocalization["coloc_count"] = None
             last_colocalization["trajectory_counts"] = None
@@ -242,7 +240,6 @@ def main():
         layer_rh5.data = np.empty((0, 3))
         layer_rh6.data = np.empty((0, 3))
         last_colocalization["seeds"] = []
-        last_colocalization["channel_points"] = {"Rh4": [], "Rh5": [], "Rh6": []}
         last_colocalization["z"] = None
         last_colocalization["coloc_count"] = None
         last_colocalization["trajectory_counts"] = None
@@ -374,13 +371,8 @@ def main():
         Works for any image, single- or multi-Z - there is no dependency on
         backtracking here.
 
-        Returns (seeds, channel_points):
-        - seeds: one dict per cluster found, with "phenotype"
-          (Rh5/Rh6/Rh5+Rh6), "y"/"x" (cluster centroid), and "z_points"
-          (the raw (y, x, target) tuples that made up the cluster)
-        - channel_points: {"Rh4"/"Rh5"/"Rh6": [(z, y, x), ...]} - the raw
-          Rh5/Rh6 detections that are part of a surviving (ROI-restricted)
-          seed. "Rh4" is always empty here - colocalization never touches it.
+        Returns one dict per cluster found, with "phenotype"
+        (Rh5/Rh6/Rh5+Rh6) and "y"/"x" (cluster centroid).
         """
         end_df = df_all[(df_all["Z"] == z) & (df_all["target"].isin(["Rh5", "Rh6"]))]
 
@@ -416,18 +408,10 @@ def main():
                         "y": float(np.mean(pts[neighbors, 0])),
                         "x": float(np.mean(pts[neighbors, 1])),
                         "phenotype": phenotype,
-                        "z_points": [
-                            (pts[n, 0], pts[n, 1], labels[n]) for n in neighbors
-                        ],
                     }
                 )
 
-        channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
-        for seed in seeds:
-            for y, x, target in seed["z_points"]:
-                channel_points[target].append((z, y, x))
-
-        return seeds, channel_points
+        return seeds
 
     def _backtrack(df_all, seeds, z, track_radius, memory):
         """Backtrack each already-colocalized seed frame-by-frame from z
@@ -436,12 +420,15 @@ def main():
         (z > 0) - callers are responsible for skipping this for single-slice
         images, where there is no lower Z to backtrack through.
 
-        Returns (results, channel_points):
-        - results: one dict per seed with "phenotype", "origin"
-          ("Rh4"/"Rh3"), and "path" ((z, y, x) tuples, seed frame first)
-        - channel_points: {"Rh4"/"Rh5"/"Rh6": [(z, y, x), ...]} - every raw
-          detection matched along a backtrack path (on top of the seed's own
-          points, which the caller already has from _colocalize)
+        The origin is Rh4 as soon as an Rh4 point is matched anywhere along
+        the backward trail - not only exactly at Z=0. Requiring it exactly
+        at Z=0 was a bug: if acquisition started deeper than the true Rh4
+        signal (so the first frames are blank), a trail that legitimately
+        passes through Rh4 at, say, Z=2 would still get misclassified as
+        Rh3 just because nothing was there at Z=0.
+
+        Returns one dict per seed with "phenotype", "origin" ("Rh4"/"Rh3"),
+        and "path" ((z, y, x) tuples, seed frame first).
         """
         # Backtracking is unrestricted by the ROI - a cell's origin (an Rh4
         # point, or nothing observed = Rh3) can lie outside the footprint
@@ -449,7 +436,6 @@ def main():
         points_by_z = {zz: g[["Y", "X"]].values for zz, g in df_all.groupby("Z")}
         targets_by_z = {zz: g["target"].values for zz, g in df_all.groupby("Z")}
 
-        channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
         results = []
         for seed in seeds:
             cur_y, cur_x = seed["y"], seed["x"]
@@ -468,9 +454,7 @@ def main():
                         path.append((zz, cur_y, cur_x))
                         missed = 0
                         found = True
-                        target = targets_by_z[zz][j]
-                        channel_points[target].append((zz, cur_y, cur_x))
-                        if zz == 0 and target == "Rh4":
+                        if targets_by_z[zz][j] == "Rh4":
                             origin = "Rh4"
 
                 if not found:
@@ -482,17 +466,17 @@ def main():
                 {"phenotype": seed["phenotype"], "origin": origin, "path": path}
             )
 
-        return results, channel_points
+        return results
 
     def _compute_transitions(df_all, z, track_radius, merge_radius, memory):
         """Colocalize then, for multi-Z stacks, backtrack - the combination
         used by the standalone ImageJ export so it doesn't depend on the
         interactive Colocalize/Backtrack buttons having been clicked first.
         """
-        seeds, channel_points = _colocalize(df_all, z, merge_radius)
+        seeds = _colocalize(df_all, z, merge_radius)
 
         if not seeds:
-            return seeds, [], channel_points
+            return seeds, []
 
         if z == 0:
             results = [
@@ -503,13 +487,10 @@ def main():
                 }
                 for s in seeds
             ]
-            return seeds, results, channel_points
+            return seeds, results
 
-        results, bt_channel_points = _backtrack(df_all, seeds, z, track_radius, memory)
-        for target in channel_points:
-            channel_points[target] = channel_points[target] + bt_channel_points[target]
-
-        return seeds, results, channel_points
+        results = _backtrack(df_all, seeds, z, track_radius, memory)
+        return seeds, results
 
     @magicgui(
         call_button="Colocalize Rh5/Rh6",
@@ -544,13 +525,14 @@ def main():
         else:
             print(f"Colocalizing at Z={z}. No ROI drawn - using the entire slice.")
 
-        seeds, channel_points = _colocalize(df_all, z, merge_radius)
+        seeds = _colocalize(df_all, z, merge_radius)
 
         # Deliberately read-only: this only reports on the current Z and may
         # be re-run as the user scrubs through a stack, so it must not touch
         # layer_rh5/layer_rh6 - overwriting them here would wipe out every
-        # other Z's detections. Pruning to survivors is Backtrack's job,
-        # since that's the actual terminal step of the analysis.
+        # other Z's detections. Backtrack doesn't prune them either (same
+        # reasoning) - the classified results live on their own in the
+        # Trajectory layer, raw detections stay untouched throughout.
 
         n_rh5 = sum(1 for s in seeds if s["phenotype"] == "Rh5")
         n_rh6 = sum(1 for s in seeds if s["phenotype"] == "Rh6")
@@ -565,7 +547,6 @@ def main():
         print("=" * 40 + "\n")
 
         last_colocalization["seeds"] = seeds
-        last_colocalization["channel_points"] = channel_points
         last_colocalization["z"] = z
         last_colocalization["coloc_count"] = n_coloc
 
@@ -610,24 +591,15 @@ def main():
         df_all = pd.concat(df_list, ignore_index=True)
         df_all["Z"] = df_all["Z"].round().astype(int)
 
-        results, bt_channel_points = _backtrack(df_all, seeds, z, track_radius, memory)
+        results = _backtrack(df_all, seeds, z, track_radius, memory)
         for r in results:
             r["label"] = f"{r['origin']} -> {r['phenotype']}"
 
-        # Merge the seed's own points (from the last Colocalize run) with
-        # whatever the backtrack paths matched, then apply to the layers.
-        channel_points = {
-            target: last_colocalization["channel_points"][target]
-            + bt_channel_points[target]
-            for target in ("Rh4", "Rh5", "Rh6")
-        }
-        for target_name, layer in [
-            ("Rh4", layer_rh4),
-            ("Rh5", layer_rh5),
-            ("Rh6", layer_rh6),
-        ]:
-            coords = channel_points[target_name]
-            layer.data = np.array(coords) if coords else np.empty((0, 3))
+        # Deliberately read-only, same as Colocalize: layer_rh4/rh5/rh6 stay
+        # as raw detections regardless of trajectory membership. Pruning them
+        # would silently break the live counts and the CSV/ImageJ exports
+        # (which read straight from these layers) after every backtrack run.
+        # The classified results live on their own in the Trajectory layer.
 
         # ---------------------------------------------------------
         # Report counts
@@ -767,7 +739,7 @@ def main():
             df_all["Z"] = df_all["Z"].round().astype(int)
             z_max = int(viewer.dims.current_step[0])
 
-            _, results, _ = _compute_transitions(
+            _, results = _compute_transitions(
                 df_all,
                 z_max,
                 backtrack_widget.track_radius.value,
