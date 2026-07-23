@@ -1,5 +1,6 @@
 import napari
 from magicgui import magicgui
+from magicgui.widgets import Container, Label
 import trackpy as tp
 import numpy as np
 import pandas as pd
@@ -17,6 +18,24 @@ from pathlib import Path
 da_raw = None
 channel_map = {}
 
+_LAST_PATH_FILE = Path.home() / ".tracker_last_path.txt"
+
+
+def _load_last_path():
+    """Returns the last .lif file chosen by the user, if it still exists."""
+    try:
+        p = Path(_LAST_PATH_FILE.read_text().strip())
+        return p if p.is_file() else None
+    except OSError:
+        return None
+
+
+def _save_last_path(path):
+    try:
+        _LAST_PATH_FILE.write_text(str(path))
+    except OSError:
+        pass
+
 
 def main():
     viewer = napari.Viewer()
@@ -25,7 +44,7 @@ def main():
         "face_color": "transparent",
         "ndim": 3,
         "size": 15,
-        "opacity": 0.5,
+        "opacity": 0.9,
     }
     layer_rh4 = viewer.add_points(name="Rh4 Points", border_color="orange", **kwargs)
     layer_rh5 = viewer.add_points(name="Rh5 Points", border_color="orange", **kwargs)
@@ -36,6 +55,15 @@ def main():
         opacity=0.4,
     )
 
+    # Result of the last "Colocalize Rh5/Rh6" run, consumed by "Backtrack to
+    # Origin". Kept separate from any UI widget so both can read/reset it.
+    last_colocalization = {
+        "seeds": [],
+        "channel_points": {"Rh4": [], "Rh5": [], "Rh6": []},
+        "z": None,
+        "coloc_count": None,
+    }
+
     def get_image_choices(widget):
         """Reads the current path from the widget and returns the valid images."""
         if widget.parent is None:
@@ -45,6 +73,8 @@ def main():
             with liffile.LifFile(path) as lif:
                 return [(f"[{i}] {img.name}", i) for i, img in enumerate(lif.images)]
         return [("Select a LIF file first", 0)]
+
+    _last_path = _load_last_path()
 
     @magicgui(
         path={"label": "1. Choose LIF file:", "filter": "*.lif"},
@@ -59,11 +89,16 @@ def main():
         call_button="Load Data into Viewer",
     )
     def filepicker(
-        path: Path,
-        image_index: int,
+        path: Path | None = _last_path,
+        image_index: int = 0,
         color_profile: str = "Profile 1 (Rh4: Green, Rh6: Red, Rh5: Blue)",
     ):
         global da_raw, channel_map
+
+        if not path:
+            print("Please choose a .lif file first.")
+            return
+
         with liffile.LifFile(path) as lif:
             da_raw = lif.images[image_index].asxarray()
 
@@ -110,6 +145,23 @@ def main():
             layer_rh4.data = np.empty((0, 3))
             layer_rh5.data = np.empty((0, 3))
             layer_rh6.data = np.empty((0, 3))
+            last_colocalization["seeds"] = []
+            last_colocalization["channel_points"] = {"Rh4": [], "Rh5": [], "Rh6": []}
+            last_colocalization["z"] = None
+            last_colocalization["coloc_count"] = None
+
+            # current_border_color (not border_color) is what new points pick
+            # up when added later during detection - border_color only
+            # recolors points that already exist, and the layers are empty
+            # here. Derived from color_map so it follows the chosen profile.
+            def _border_rgba(target, alpha=0.9):
+                rgba = transform_color(color_map[target])[0].copy()
+                rgba[3] = alpha
+                return rgba
+
+            layer_rh4.current_border_color = _border_rgba("Rh4")
+            layer_rh5.current_border_color = _border_rgba("Rh5")
+            layer_rh6.current_border_color = _border_rgba("Rh6")
 
             size_y, size_x = da_raw.shape[-2], da_raw.shape[-1]
             layer_roi.data = np.zeros((size_y, size_x), dtype=np.int32)
@@ -134,6 +186,8 @@ def main():
     @filepicker.path.changed.connect
     def _update_dropdown(new_path: Path):
         filepicker.image_index.reset_choices()
+        if new_path and Path(new_path).is_file():
+            _save_last_path(new_path)
 
     @magicgui(call_button="Flip Z-Axis (Up/Down)")
     def flip_z_axis_widget():
@@ -162,6 +216,10 @@ def main():
         layer_rh4.data = np.empty((0, 3))
         layer_rh5.data = np.empty((0, 3))
         layer_rh6.data = np.empty((0, 3))
+        last_colocalization["seeds"] = []
+        last_colocalization["channel_points"] = {"Rh4": [], "Rh5": [], "Rh6": []}
+        last_colocalization["z"] = None
+        last_colocalization["coloc_count"] = None
         if "Trajectories" in viewer.layers:
             viewer.layers.remove("Trajectories")
 
@@ -169,8 +227,12 @@ def main():
         print("Success: Z-axis inverted. Cleared stale detections/tracks.")
 
     @thread_worker
-    def _run_detection(channels_to_process, diameter, minmass, threshold):
+    def _run_detection(channels_to_process, z_current, diameter, minmass, threshold):
         c_axis = len(da_raw.shape) - 3
+
+        roi_data = np.asarray(layer_roi.data)
+        has_roi = np.any(roi_data)
+        roi_mask = roi_data.astype(bool) if has_roi else None
 
         # Process each selected channel sequentially, off the UI thread
         for ch in channels_to_process:
@@ -196,12 +258,21 @@ def main():
                 # here - it's the same one slice for every channel - so it's
                 # safe (and desired) to restrict detection itself to the ROI,
                 # rather than relying on later steps to filter it out.
-                roi_data = np.asarray(layer_roi.data)
-                if np.any(roi_data):
-                    volume = volume * roi_data.astype(bool)
+                if has_roi:
+                    volume = volume * roi_mask
                 # trackpy.batch still needs a leading frame axis to iterate
                 # over, even if there's only one
                 volume = volume[np.newaxis, :, :]
+            elif has_roi:
+                # Multi-Z stack: only the Z the user was viewing when they
+                # clicked Predict is restricted to the ROI - matching what
+                # Colocalize/Backtrack already treat as "the Z of interest",
+                # so the live point counts stay consistent with it. Every
+                # other Z stays unmasked, since backtracking still needs to
+                # find an Rh4 origin that may lie outside that footprint.
+                z_idx = int(np.clip(z_current, 0, volume.shape[0] - 1))
+                volume = volume.copy()
+                volume[z_idx] = volume[z_idx] * roi_mask
 
             # Run Trackpy
             f = tp.batch(
@@ -230,7 +301,14 @@ def main():
         minmass: int = 700,
         threshold: int = 30,
     ):
-        print(f"\n--- Starting Batch Prediction: {target_channel} (all Z) ---")
+        z_current = int(viewer.dims.current_step[0])
+        if np.any(np.asarray(layer_roi.data)):
+            print(
+                f"\n--- Starting Batch Prediction: {target_channel} "
+                f"(Z={z_current} restricted to ROI, other Z's unmasked) ---"
+            )
+        else:
+            print(f"\n--- Starting Batch Prediction: {target_channel} (all Z) ---")
 
         target_layers = {
             "Rh4": layer_rh4,
@@ -259,30 +337,27 @@ def main():
             print("--- Batch Prediction Complete! ---\n")
 
         predict_all_frames_widget.call_button.enabled = False
-        worker = _run_detection(channels_to_process, diameter, minmass, threshold)
+        worker = _run_detection(
+            channels_to_process, z_current, diameter, minmass, threshold
+        )
         worker.yielded.connect(_update_layer)
         worker.finished.connect(_on_finished)
         worker.start()
 
-    def _compute_transitions(df_all, z_max, track_radius, merge_radius, memory):
-        """Colocalize Rh5/Rh6 at z_max (inside the ROI drawn on that slice),
-        then, for multi-Z stacks, backtrack each colocalized point toward
-        Z=0 to determine whether it originates from an Rh4 point or from
-        nothing observed (Rh3). Single-slice images (z_max == 0) have no
-        lower Z to backtrack through, so "origin" stays None for them -
-        only the raw colocalization is meaningful, not a transition.
+    def _colocalize(df_all, z, merge_radius):
+        """Colocalize Rh5/Rh6 at frame z, inside the ROI drawn on that slice.
+        Works for any image, single- or multi-Z - there is no dependency on
+        backtracking here.
 
-        Returns (seeds, results, channel_points):
-        - seeds: the Rh5/Rh6 clusters found at z_max
-        - results: one dict per seed with "phenotype" (Rh5/Rh6/Rh5+Rh6),
-          "origin" ("Rh4"/"Rh3"/None), and "path" ((z, y, x) tuples,
-          seed frame first)
-        - channel_points: {"Rh4"/"Rh5"/"Rh6": [(z, y, x), ...]} - every raw
-          detection that is part of a surviving seed or backtrack path
+        Returns (seeds, channel_points):
+        - seeds: one dict per cluster found, with "phenotype"
+          (Rh5/Rh6/Rh5+Rh6), "y"/"x" (cluster centroid), and "z_points"
+          (the raw (y, x, target) tuples that made up the cluster)
+        - channel_points: {"Rh4"/"Rh5"/"Rh6": [(z, y, x), ...]} - the raw
+          Rh5/Rh6 detections that are part of a surviving (ROI-restricted)
+          seed. "Rh4" is always empty here - colocalization never touches it.
         """
-        end_df = df_all[
-            (df_all["Z"] == z_max) & (df_all["target"].isin(["Rh5", "Rh6"]))
-        ]
+        end_df = df_all[(df_all["Z"] == z) & (df_all["target"].isin(["Rh5", "Rh6"]))]
 
         if np.any(layer_roi.data):
             roi_mask = layer_roi.data.astype(bool)
@@ -323,51 +398,54 @@ def main():
                 )
 
         channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
-        if not seeds:
-            return seeds, [], channel_points
-
         for seed in seeds:
             for y, x, target in seed["z_points"]:
-                channel_points[target].append((z_max, y, x))
+                channel_points[target].append((z, y, x))
 
-        if z_max == 0:
-            results = [
-                {
-                    "phenotype": s["phenotype"],
-                    "origin": None,
-                    "path": [(z_max, s["y"], s["x"])],
-                }
-                for s in seeds
-            ]
-            return seeds, results, channel_points
+        return seeds, channel_points
 
+    def _backtrack(df_all, seeds, z, track_radius, memory):
+        """Backtrack each already-colocalized seed frame-by-frame from z
+        toward Z=0, to determine whether it originates from an Rh4 point or
+        from nothing observed (Rh3). Only meaningful for multi-Z stacks
+        (z > 0) - callers are responsible for skipping this for single-slice
+        images, where there is no lower Z to backtrack through.
+
+        Returns (results, channel_points):
+        - results: one dict per seed with "phenotype", "origin"
+          ("Rh4"/"Rh3"), and "path" ((z, y, x) tuples, seed frame first)
+        - channel_points: {"Rh4"/"Rh5"/"Rh6": [(z, y, x), ...]} - every raw
+          detection matched along a backtrack path (on top of the seed's own
+          points, which the caller already has from _colocalize)
+        """
         # Backtracking is unrestricted by the ROI - a cell's origin (an Rh4
         # point, or nothing observed = Rh3) can lie outside the footprint
         # drawn at the last Z, since cells drift as they differentiate.
-        points_by_z = {z: g[["Y", "X"]].values for z, g in df_all.groupby("Z")}
-        targets_by_z = {z: g["target"].values for z, g in df_all.groupby("Z")}
+        points_by_z = {zz: g[["Y", "X"]].values for zz, g in df_all.groupby("Z")}
+        targets_by_z = {zz: g["target"].values for zz, g in df_all.groupby("Z")}
 
+        channel_points = {"Rh4": [], "Rh5": [], "Rh6": []}
         results = []
         for seed in seeds:
             cur_y, cur_x = seed["y"], seed["x"]
-            path = [(z_max, cur_y, cur_x)]
+            path = [(z, cur_y, cur_x)]
             missed = 0
             origin = "Rh3"  # default: trail never confirms an Rh4 point
 
-            for z in range(z_max - 1, -1, -1):
-                pts = points_by_z.get(z)
+            for zz in range(z - 1, -1, -1):
+                pts = points_by_z.get(zz)
                 found = False
                 if pts is not None and len(pts):
                     dists = np.hypot(pts[:, 0] - cur_y, pts[:, 1] - cur_x)
                     j = int(np.argmin(dists))
                     if dists[j] <= track_radius:
                         cur_y, cur_x = pts[j]
-                        path.append((z, cur_y, cur_x))
+                        path.append((zz, cur_y, cur_x))
                         missed = 0
                         found = True
-                        target = targets_by_z[z][j]
-                        channel_points[target].append((z, cur_y, cur_x))
-                        if z == 0 and target == "Rh4":
+                        target = targets_by_z[zz][j]
+                        channel_points[target].append((zz, cur_y, cur_x))
+                        if zz == 0 and target == "Rh4":
                             origin = "Rh4"
 
                 if not found:
@@ -379,28 +457,120 @@ def main():
                 {"phenotype": seed["phenotype"], "origin": origin, "path": path}
             )
 
+        return results, channel_points
+
+    def _compute_transitions(df_all, z, track_radius, merge_radius, memory):
+        """Colocalize then, for multi-Z stacks, backtrack - the combination
+        used by the standalone ImageJ export so it doesn't depend on the
+        interactive Colocalize/Backtrack buttons having been clicked first.
+        """
+        seeds, channel_points = _colocalize(df_all, z, merge_radius)
+
+        if not seeds:
+            return seeds, [], channel_points
+
+        if z == 0:
+            results = [
+                {
+                    "phenotype": s["phenotype"],
+                    "origin": None,
+                    "path": [(z, s["y"], s["x"])],
+                }
+                for s in seeds
+            ]
+            return seeds, results, channel_points
+
+        results, bt_channel_points = _backtrack(df_all, seeds, z, track_radius, memory)
+        for target in channel_points:
+            channel_points[target] = channel_points[target] + bt_channel_points[target]
+
         return seeds, results, channel_points
 
     @magicgui(
-        call_button="Colocalize & Backtrack",
-        track_radius={"label": "Max Backtrack Drift (px)", "max": 50},
+        call_button="Colocalize Rh5/Rh6",
         merge_radius={
             "label": "Colocalization Radius (px)",
             "max": 20,
             "tooltip": "Merge Rh5/Rh6 dots closer than this into one cell",
         },
+    )
+    def colocalize_widget(merge_radius: float = 5.0):
+        print("\n--- Colocalizing Rh5/Rh6 at the current Z ---")
+
+        df_list = []
+        for layer, target_name in [(layer_rh5, "Rh5"), (layer_rh6, "Rh6")]:
+            if len(layer.data) > 0:
+                df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
+                df["target"] = target_name
+                df_list.append(df)
+
+        if not df_list:
+            print("No Rh5/Rh6 points found. Run prediction first.")
+            return
+
+        df_all = pd.concat(df_list, ignore_index=True)
+        df_all["Z"] = df_all["Z"].round().astype(int)
+
+        # Whatever Z the user is currently viewing gets colocalized - works
+        # equally for a single 2D image or one frame of a multi-Z stack.
+        z = int(viewer.dims.current_step[0])
+        if np.any(layer_roi.data):
+            print(f"Colocalizing at Z={z}, restricted to the drawn ROI.")
+        else:
+            print(f"Colocalizing at Z={z}. No ROI drawn - using the entire slice.")
+
+        seeds, channel_points = _colocalize(df_all, z, merge_radius)
+
+        # Deliberately read-only: this only reports on the current Z and may
+        # be re-run as the user scrubs through a stack, so it must not touch
+        # layer_rh5/layer_rh6 - overwriting them here would wipe out every
+        # other Z's detections. Pruning to survivors is Backtrack's job,
+        # since that's the actual terminal step of the analysis.
+
+        n_rh5 = sum(1 for s in seeds if s["phenotype"] == "Rh5")
+        n_rh6 = sum(1 for s in seeds if s["phenotype"] == "Rh6")
+        n_coloc = sum(1 for s in seeds if s["phenotype"] == "Rh5+Rh6")
+
+        print("\n" + "=" * 40)
+        print(f"📊 COLOCALIZATION COUNT (Z={z})")
+        print("=" * 40)
+        print(f" -> Rh5 only : {n_rh5}")
+        print(f" -> Rh6 only : {n_rh6}")
+        print(f" -> Rh5+Rh6  : {n_coloc}")
+        print("=" * 40 + "\n")
+
+        last_colocalization["seeds"] = seeds
+        last_colocalization["channel_points"] = channel_points
+        last_colocalization["z"] = z
+        last_colocalization["coloc_count"] = n_coloc
+
+        _update_counts()
+
+    @magicgui(
+        call_button="Backtrack to Origin",
+        track_radius={"label": "Max Backtrack Drift (px)", "max": 50},
         memory={
             "label": "Memory (frames)",
             "max": 5,
             "tooltip": "Max consecutive frames a cell can go undetected while backtracking",
         },
     )
-    def link_and_track_widget(
-        track_radius: int = 15,
-        merge_radius: float = 5.0,
-        memory: int = 1,
-    ):
-        print("\n--- Colocalizing at the last Z and backtracking to origin ---")
+    def backtrack_widget(track_radius: int = 15, memory: int = 1):
+        seeds = last_colocalization["seeds"]
+        z = last_colocalization["z"]
+
+        if not seeds:
+            print("Run 'Colocalize Rh5/Rh6' first.\n")
+            return
+
+        if z == 0:
+            print(
+                "Single-slice image: no lower Z to backtrack through, so "
+                "Rh4/Rh3 origin can't be determined.\n"
+            )
+            return
+
+        print(f"\n--- Backtracking from Z={z} to origin ---")
 
         df_list = []
         for layer, target_name in [
@@ -412,50 +582,25 @@ def main():
                 df = pd.DataFrame(layer.data, columns=["Z", "Y", "X"])
                 df["target"] = target_name
                 df_list.append(df)
-
-        if not df_list:
-            print("No points found in any layer. Run prediction first.")
-            return
-
         df_all = pd.concat(df_list, ignore_index=True)
         df_all["Z"] = df_all["Z"].round().astype(int)
 
-        # Whatever Z the user is currently viewing is the last useful frame -
-        # navigate there (where Rh5/Rh6 are clearest) before clicking this.
-        z_max = int(viewer.dims.current_step[0])
-        if np.any(layer_roi.data):
-            print(f"Seeding from Z={z_max}, restricted to the drawn ROI.")
-        else:
-            print(f"Seeding from Z={z_max}. No ROI drawn - using the entire slice.")
-
-        seeds, results, channel_points = _compute_transitions(
-            df_all, z_max, track_radius, merge_radius, memory
-        )
-
-        if not seeds:
-            print("No Rh5/Rh6 points found at the last Z (inside the ROI).\n")
-            return
-
-        single_slice = z_max == 0
-        if single_slice:
-            print(
-                "Single-slice image: no lower Z to backtrack through, so Rh4/Rh3 "
-                "origin can't be determined - showing raw colocalization only."
-            )
+        results, bt_channel_points = _backtrack(df_all, seeds, z, track_radius, memory)
         for r in results:
-            r["label"] = (
-                r["phenotype"]
-                if single_slice
-                else f"{r['origin']} -> {r['phenotype']}"
-            )
+            r["label"] = f"{r['origin']} -> {r['phenotype']}"
 
-        # Keep only the points that belong to a surviving Rh5/Rh6 seed (and, for
-        # multi-Z stacks, a confirmed backtrack path). A single slice can't say
-        # anything about Rh4's relevance, so its points are left untouched.
-        layers_to_clean = [("Rh5", layer_rh5), ("Rh6", layer_rh6)]
-        if not single_slice:
-            layers_to_clean.append(("Rh4", layer_rh4))
-        for target_name, layer in layers_to_clean:
+        # Merge the seed's own points (from the last Colocalize run) with
+        # whatever the backtrack paths matched, then apply to the layers.
+        channel_points = {
+            target: last_colocalization["channel_points"][target]
+            + bt_channel_points[target]
+            for target in ("Rh4", "Rh5", "Rh6")
+        }
+        for target_name, layer in [
+            ("Rh4", layer_rh4),
+            ("Rh5", layer_rh5),
+            ("Rh6", layer_rh6),
+        ]:
             coords = channel_points[target_name]
             layer.data = np.array(coords) if coords else np.empty((0, 3))
 
@@ -463,22 +608,17 @@ def main():
         # Report counts
         # ---------------------------------------------------------
         counts = pd.Series([r["label"] for r in results]).value_counts()
-        if single_slice:
-            categories = ["Rh5", "Rh6", "Rh5+Rh6"]
-            header = f"📊 FINAL COUNT (colocalized at Z={z_max})"
-        else:
-            categories = [
-                "Rh4 -> Rh5",
-                "Rh4 -> Rh6",
-                "Rh4 -> Rh5+Rh6",
-                "Rh3 -> Rh5",
-                "Rh3 -> Rh6",
-                "Rh3 -> Rh5+Rh6",
-            ]
-            header = f"📊 FINAL COUNT (colocalized at Z={z_max}, backtracked to origin)"
+        categories = [
+            "Rh4 -> Rh5",
+            "Rh4 -> Rh6",
+            "Rh4 -> Rh5+Rh6",
+            "Rh3 -> Rh5",
+            "Rh3 -> Rh6",
+            "Rh3 -> Rh5+Rh6",
+        ]
 
         print("\n" + "=" * 40)
-        print(header)
+        print(f"📊 FINAL COUNT (colocalized at Z={z}, backtracked to origin)")
         print("=" * 40)
         for cat in categories:
             print(f" -> {cat:<16}: {counts.get(cat, 0)}")
@@ -494,9 +634,6 @@ def main():
             "Rh3 -> Rh5": "steelblue",
             "Rh3 -> Rh6": "orchid",
             "Rh3 -> Rh5+Rh6": "khaki",
-            "Rh5": "cyan",
-            "Rh6": "magenta",
-            "Rh5+Rh6": "yellow",
         }
 
         if "Trajectories" in viewer.layers:
@@ -505,13 +642,13 @@ def main():
         track_rows = [
             {
                 "particle": idx,
-                "frame": z,
+                "frame": zz,
                 "y": y,
                 "x": x,
                 "Track_Phenotype": r["label"],
             }
             for idx, r in enumerate(results)
-            for (z, y, x) in r["path"]
+            for (zz, y, x) in r["path"]
         ]
         t_display = (
             pd.DataFrame(track_rows)
@@ -553,7 +690,7 @@ def main():
             colormaps_dict={"color_val": custom_cmap},
             name="Trajectories",
             tail_width=4,
-            tail_length=z_max + 5,
+            tail_length=z + 5,
         )
 
     @magicgui(
@@ -631,9 +768,9 @@ def main():
                 _add(marker_type, z, y, x)
 
         # Types 1/2/3/7 need colocalization/backtracking, reusing the exact
-        # same computation as "Colocalize & Backtrack" (and whatever
-        # parameters are currently set on that panel), but without touching
-        # any layers - this works standalone, without that button having
+        # same computation as the Colocalize/Backtrack widgets (and whatever
+        # parameters are currently set on those panels), but without touching
+        # any layers - this works standalone, without those buttons having
         # been clicked first.
         df_list = []
         for layer, target_name in [
@@ -654,9 +791,9 @@ def main():
             _, results, _ = _compute_transitions(
                 df_all,
                 z_max,
-                link_and_track_widget.track_radius.value,
-                link_and_track_widget.merge_radius.value,
-                link_and_track_widget.memory.value,
+                backtrack_widget.track_radius.value,
+                colocalize_widget.merge_radius.value,
+                backtrack_widget.memory.value,
             )
 
             for r in results:
@@ -724,6 +861,38 @@ def main():
             print(f"  Type {t} ({type_labels[t]}): {len(markers[t])}")
         print("----------------------------\n")
 
+    # Blank label for manual wiring
+    info_label = Label(value="")
+    info_widget = Container(widgets=[info_label])
+
+    def _update_counts(event=None):
+        z = int(viewer.dims.current_step[0])
+
+        def _count_at_z(layer):
+            data = layer.data
+            if len(data) == 0:
+                return 0
+            return int(np.sum(np.round(data[:, 0]).astype(int) == z))
+
+        coloc_count = last_colocalization["coloc_count"]
+        coloc_str = "N/A" if coloc_count is None else str(coloc_count)
+
+        info_label.value = (
+            f"Rh4: {_count_at_z(layer_rh4)}  |  "
+            f"Rh5: {_count_at_z(layer_rh5)}  |  "
+            f"Rh6: {_count_at_z(layer_rh6)}  |  "
+            f"Rh5+Rh6: {coloc_str}"
+        )
+
+    # Live-update on manual edits, predictions overwriting .data, and
+    # scrubbing the Z-slider (counts are always "at the current Z")
+    layer_rh4.events.data.connect(_update_counts)
+    layer_rh5.events.data.connect(_update_counts)
+    layer_rh6.events.data.connect(_update_counts)
+    viewer.dims.events.current_step.connect(_update_counts)
+
+    _update_counts()
+
     # Swap out or add this widget to the sidebar
     viewer.window.add_dock_widget(filepicker, name="1. Load File", area="right")
     viewer.window.add_dock_widget(
@@ -732,15 +901,15 @@ def main():
     viewer.window.add_dock_widget(
         predict_all_frames_widget, name="2. Point detection", area="right"
     )
-    viewer.window.add_dock_widget(
-        link_and_track_widget, name="3. Colocalize & Backtrack", area="right"
-    )
-    viewer.window.add_dock_widget(
-        export_points_widget, name="4. Export Results", area="right"
-    )
-    viewer.window.add_dock_widget(
-        export_cellcounter_widget, name="5. Export to ImageJ", area="right"
-    )
+    viewer.window.add_dock_widget(colocalize_widget, name="3. Colocalize", area="right")
+    viewer.window.add_dock_widget(backtrack_widget, name="4. Backtrack", area="right")
+    # viewer.window.add_dock_widget(
+    #     export_points_widget, name="5. Export Results", area="right"
+    # )
+    # viewer.window.add_dock_widget(
+    #     export_cellcounter_widget, name="6. Export to ImageJ", area="right"
+    # )
+    viewer.window.add_dock_widget(info_widget, name="7. Info", area="right")
 
     napari.run()
 
