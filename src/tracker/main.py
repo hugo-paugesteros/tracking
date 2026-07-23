@@ -6,17 +6,28 @@ import numpy as np
 import pandas as pd
 import liffile
 from scipy.spatial import cKDTree
-from napari.utils.colormaps import Colormap
 from napari.utils.color import transform_color
 from napari.qt.threading import thread_worker
 import xml.etree.ElementTree as ET
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 
 da_raw = None
 channel_map = {}
+
+# Edge color per trajectory type, shown on the "Trajectory" layer after
+# backtracking. Rh3-origin trajectories are left uncoloured by default.
+TRAJECTORY_COLORS = {
+    "Rh4 -> Rh5": "cyan",
+    "Rh4 -> Rh6": "magenta",
+    "Rh4 -> Rh5+Rh6": "yellow",
+    "Rh3 -> Rh5": "transparent",
+    "Rh3 -> Rh6": "transparent",
+    "Rh3 -> Rh5+Rh6": "transparent",
+}
 
 _LAST_PATH_FILE = Path.home() / ".tracker_last_path.txt"
 
@@ -54,14 +65,26 @@ def main():
         name="1. Draw ROI Here",
         opacity=0.4,
     )
+    # ndim=2 (no Z) so the same dots stay visible on every Z of the stack,
+    # matching how biologists already annotate trajectories by eye: one dot
+    # per trajectory, not one per Z. Edge-only color, filled in by backtrack.
+    layer_trajectory = viewer.add_points(
+        name="Trajectory",
+        ndim=2,
+        face_color="transparent",
+        border_color="transparent",
+        size=15,
+        opacity=0.9,
+    )
 
     # Result of the last "Colocalize Rh5/Rh6" run, consumed by "Backtrack to
     # Origin". Kept separate from any UI widget so both can read/reset it.
-    last_colocalization = {
+    last_colocalization: dict[str, Any] = {
         "seeds": [],
         "channel_points": {"Rh4": [], "Rh5": [], "Rh6": []},
         "z": None,
         "coloc_count": None,
+        "trajectory_counts": None,
     }
 
     def get_image_choices(widget):
@@ -149,6 +172,8 @@ def main():
             last_colocalization["channel_points"] = {"Rh4": [], "Rh5": [], "Rh6": []}
             last_colocalization["z"] = None
             last_colocalization["coloc_count"] = None
+            last_colocalization["trajectory_counts"] = None
+            layer_trajectory.data = np.empty((0, 2))
 
             # current_border_color (not border_color) is what new points pick
             # up when added later during detection - border_color only
@@ -220,8 +245,8 @@ def main():
         last_colocalization["channel_points"] = {"Rh4": [], "Rh5": [], "Rh6": []}
         last_colocalization["z"] = None
         last_colocalization["coloc_count"] = None
-        if "Trajectories" in viewer.layers:
-            viewer.layers.remove("Trajectories")
+        last_colocalization["trajectory_counts"] = None
+        layer_trajectory.data = np.empty((0, 2))
 
         viewer.dims.set_current_step(0, 0)
         print("Success: Z-axis inverted. Cleared stale detections/tracks.")
@@ -624,74 +649,28 @@ def main():
             print(f" -> {cat:<16}: {counts.get(cat, 0)}")
         print("=" * 40 + "\n")
 
-        # ---------------------------------------------------------
-        # Push results to the viewer as Tracks
-        # ---------------------------------------------------------
-        master_color_dict = {
-            "Rh4 -> Rh5": "cyan",
-            "Rh4 -> Rh6": "magenta",
-            "Rh4 -> Rh5+Rh6": "yellow",
-            "Rh3 -> Rh5": "steelblue",
-            "Rh3 -> Rh6": "orchid",
-            "Rh3 -> Rh5+Rh6": "khaki",
+        last_colocalization["trajectory_counts"] = {
+            cat: int(counts.get(cat, 0)) for cat in categories
         }
 
-        if "Trajectories" in viewer.layers:
-            viewer.layers.remove("Trajectories")
-
-        track_rows = [
-            {
-                "particle": idx,
-                "frame": zz,
-                "y": y,
-                "x": x,
-                "Track_Phenotype": r["label"],
-            }
-            for idx, r in enumerate(results)
-            for (zz, y, x) in r["path"]
-        ]
-        t_display = (
-            pd.DataFrame(track_rows)
-            .sort_values(["particle", "frame"])
-            .reset_index(drop=True)
+        # ---------------------------------------------------------
+        # Push results to the Trajectory layer - one dot per trajectory
+        # (not per Z), at its Rh5/Rh6 seed position, edge-colored by type
+        # ---------------------------------------------------------
+        trajectory_data = np.array(
+            [[r["path"][0][1], r["path"][0][2]] for r in results]
+        )
+        edge_colors = np.array(
+            [transform_color(TRAJECTORY_COLORS[r["label"]])[0] for r in results]
         )
 
-        active_phenos = t_display["Track_Phenotype"].unique().tolist()
-        N = len(active_phenos)
-
-        if N == 1:
-            pheno_float_list = [0.5] * len(t_display)
-            c = transform_color(master_color_dict[active_phenos[0]])[0]
-            custom_cmap = Colormap(colors=[c, c], name="exact_cmap")
-        else:
-            pheno_to_float = {
-                pheno: float(i) / (N - 1) for i, pheno in enumerate(active_phenos)
-            }
-            pheno_float_list = [pheno_to_float[p] for p in t_display["Track_Phenotype"]]
-
-            rgba_colors = [
-                transform_color(master_color_dict[k])[0] for k in active_phenos
-            ]
-            controls = np.linspace(0, 1, N)
-            custom_cmap = Colormap(
-                colors=rgba_colors, controls=controls, name="exact_cmap"
-            )
-
-        track_data = t_display[["particle", "frame", "y", "x"]].values
-        track_props = {
-            "Track_Phenotype": t_display["Track_Phenotype"].tolist(),
-            "color_val": pheno_float_list,
-        }
-
-        viewer.add_tracks(
-            track_data,
-            properties=track_props,
-            color_by="color_val",
-            colormaps_dict={"color_val": custom_cmap},
-            name="Trajectories",
-            tail_width=4,
-            tail_length=z + 5,
+        layer_trajectory.data = trajectory_data
+        layer_trajectory.border_color = edge_colors
+        layer_trajectory.features = pd.DataFrame(
+            {"Track_Phenotype": [r["label"] for r in results]}
         )
+
+        _update_counts()
 
     @magicgui(
         call_button="Save Points to CSV",
@@ -877,12 +856,28 @@ def main():
         coloc_count = last_colocalization["coloc_count"]
         coloc_str = "N/A" if coloc_count is None else str(coloc_count)
 
-        info_label.value = (
+        line1 = (
             f"Rh4: {_count_at_z(layer_rh4)}  |  "
             f"Rh5: {_count_at_z(layer_rh5)}  |  "
             f"Rh6: {_count_at_z(layer_rh6)}  |  "
             f"Rh5+Rh6: {coloc_str}"
         )
+
+        trajectory_counts = last_colocalization["trajectory_counts"]
+        rh3_categories = ["Rh3 -> Rh5", "Rh3 -> Rh6", "Rh3 -> Rh5+Rh6"]
+        rh4_categories = ["Rh4 -> Rh5", "Rh4 -> Rh6", "Rh4 -> Rh5+Rh6"]
+
+        def _trajectory_line(categories):
+            if trajectory_counts is None:
+                return "N/A"
+            return "  |  ".join(
+                f"{cat}: {trajectory_counts.get(cat, 0)}" for cat in categories
+            )
+
+        line2 = _trajectory_line(rh3_categories)
+        line3 = _trajectory_line(rh4_categories)
+
+        info_label.value = f"{line1}\n{line2}\n{line3}"
 
     # Live-update on manual edits, predictions overwriting .data, and
     # scrubbing the Z-slider (counts are always "at the current Z")
